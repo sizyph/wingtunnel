@@ -2,7 +2,9 @@
 
 **Interactive 2D LBM airfoil simulator in a single HTML file.**
 
-Open [`wingtunnel.html`](wingtunnel.html) in a modern browser. No build step, no dependencies — everything runs in vanilla JavaScript on a 2D canvas.
+🛩  **Try it live:** **https://sizyph.github.io/wingtunnel/**
+
+Or open [`wingtunnel.html`](wingtunnel.html) in a modern browser locally. No build step, no dependencies — everything runs in vanilla JavaScript on a 2D canvas.
 
 ## What it does
 
