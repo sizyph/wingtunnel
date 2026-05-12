@@ -1,0 +1,1544 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Wingtunnel · interactive LBM airfoil sim</title>
+    <style>
+        :root {
+            --bg-color: #111;
+            --panel-bg: rgba(30, 30, 30, 0.65);
+            --accent: #00d2ff;
+            --text-main: #eee;
+            --text-dim: #aaa;
+        }
+
+        body {
+            margin: 0;
+            padding: 0;
+            background-color: var(--bg-color);
+            color: var(--text-main);
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            overflow: hidden; /* No scrollbars */
+            height: 100vh;
+            width: 100vw;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+
+        /* The Simulation Canvas */
+        canvas {
+            display: block;
+            width: 100%;
+            height: 100%;
+            object-fit: contain; 
+            image-rendering: pixelated; /* Fluid looks retro/scientific */
+        }
+
+        /* Floating UI Panel */
+        #ui-layer {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            width: 320px;
+            max-height: calc(100vh - 40px);
+            overflow-y: auto;
+            background: var(--panel-bg);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 12px;
+            padding: 20px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+            transition: opacity 0.3s;
+            scrollbar-width: thin;
+            scrollbar-color: rgba(255,255,255,0.2) transparent;
+        }
+        #ui-layer::-webkit-scrollbar { width: 6px; }
+        #ui-layer::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.2); border-radius: 3px; }
+        #ui-layer::-webkit-scrollbar-track { background: transparent; }
+
+        h1 {
+            font-size: 1.25rem;
+            margin: 0 0 15px 0;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+            padding-bottom: 10px;
+            letter-spacing: 0.5px;
+            color: var(--accent);
+            line-height: 1.1;
+        }
+        h1 .subtitle {
+            display: block;
+            font-size: 0.65rem;
+            font-weight: 400;
+            color: var(--text-dim);
+            letter-spacing: 0.6px;
+            margin-top: 4px;
+            opacity: 0.75;
+            text-transform: lowercase;
+        }
+
+        .control-group {
+            margin-bottom: 15px;
+        }
+
+        label {
+            display: flex;
+            justify-content: space-between;
+            font-size: 0.8rem;
+            color: var(--text-dim);
+            margin-bottom: 5px;
+        }
+
+        .val-disp {
+            color: var(--text-main);
+            font-weight: 600;
+            font-family: monospace;
+        }
+
+        /* Custom Sliders */
+        input[type=range] {
+            -webkit-appearance: none;
+            width: 100%;
+            background: transparent;
+        }
+
+        input[type=range]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            height: 14px;
+            width: 14px;
+            border-radius: 50%;
+            background: var(--accent);
+            cursor: pointer;
+            margin-top: -4px;
+            box-shadow: 0 0 10px rgba(0, 210, 255, 0.5);
+        }
+
+        input[type=range]::-webkit-slider-runnable-track {
+            width: 100%;
+            height: 6px;
+            cursor: pointer;
+            background:
+                repeating-linear-gradient(to right,
+                    rgba(255,255,255,0.35) 0,
+                    rgba(255,255,255,0.35) 1px,
+                    transparent 1px,
+                    transparent 25%
+                ),
+                rgba(255,255,255,0.15);
+            border-radius: 3px;
+        }
+
+        .slider-scale {
+            display: flex;
+            justify-content: space-between;
+            font-size: 0.62rem;
+            color: var(--text-dim);
+            margin-top: 1px;
+            padding: 0 1px;
+            opacity: 0.65;
+            pointer-events: none;
+        }
+
+        h2.section {
+            font-size: 0.68rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 1.5px;
+            color: var(--accent);
+            opacity: 0.7;
+            margin: 18px 0 10px 0;
+            padding-bottom: 6px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+        }
+        h2.section:first-of-type { margin-top: 4px; }
+
+        .hint {
+            font-size: 0.65rem;
+            color: var(--text-dim);
+            margin-top: 14px;
+            padding-top: 8px;
+            border-top: 1px solid rgba(255, 255, 255, 0.08);
+            line-height: 1.9;
+            opacity: 0.7;
+        }
+        .hint kbd {
+            display: inline-block;
+            padding: 1px 5px;
+            background: rgba(255,255,255,0.08);
+            border: 1px solid rgba(255,255,255,0.14);
+            border-bottom-width: 2px;
+            border-radius: 3px;
+            color: var(--text-main);
+            font-family: monospace;
+            font-size: 0.62rem;
+            margin: 0 1px;
+        }
+
+        button:disabled,
+        input:disabled {
+            opacity: 0.35;
+            cursor: not-allowed;
+        }
+
+        .stats {
+            font-family: monospace;
+            font-size: 0.75rem;
+            color: #888;
+            margin-top: 15px;
+            padding-top: 10px;
+            border-top: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        input[type=text] {
+            width: 100%;
+            padding: 6px 10px;
+            background: rgba(255,255,255,0.1);
+            border: 1px solid rgba(255,255,255,0.1);
+            color: var(--text-main);
+            border-radius: 6px;
+            font-family: monospace;
+            font-size: 1rem;
+            letter-spacing: 3px;
+            text-align: center;
+            box-sizing: border-box;
+        }
+        input[type=text]:focus {
+            outline: none;
+            border-color: var(--accent);
+        }
+
+        .btn-row {
+            display: flex;
+            gap: 10px;
+            margin-top: 10px;
+        }
+
+        button {
+            flex: 1;
+            padding: 8px;
+            background: rgba(255,255,255,0.1);
+            border: 1px solid rgba(255,255,255,0.1);
+            color: white;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.8rem;
+            transition: background 0.2s;
+        }
+        button:hover { background: rgba(255,255,255,0.2); }
+        button.active { background: var(--accent); color: #000; font-weight: bold; }
+
+    </style>
+</head>
+<body>
+
+    <!-- Main Canvas -->
+    <canvas id="simCanvas"></canvas>
+
+    <!-- UI Overlay -->
+    <div id="ui-layer">
+        <h1>Wingtunnel<span class="subtitle">interactive LBM airfoil sim</span></h1>
+
+        <h2 class="section">Flow</h2>
+        <div class="control-group">
+            <label>Speed (Mach) <span id="disp_speed" class="val-disp">0.10</span></label>
+            <input type="range" id="in_speed" min="0.00" max="0.3" step="0.01" value="0.1">
+            <div class="slider-scale"><span>0</span><span>0.15</span><span>0.30</span></div>
+        </div>
+        <div class="control-group">
+            <label>Viscosity ν <span id="disp_visc" class="val-disp">0.020</span></label>
+            <input type="range" id="in_visc" min="0.005" max="0.08" step="0.001" value="0.02">
+            <div class="slider-scale"><span>0.005</span><span>0.04</span><span>0.08</span></div>
+        </div>
+
+        <h2 class="section">Geometry</h2>
+        <div class="control-group">
+            <label>Angle of Attack <span id="disp_aoa" class="val-disp">15°</span></label>
+            <input type="range" id="in_aoa" min="-45" max="45" step="1" value="15" data-geo="true">
+            <div class="slider-scale"><span>−45°</span><span>0°</span><span>+45°</span></div>
+        </div>
+        <div class="control-group">
+            <label>Airfoil <span id="disp_geom" class="val-disp">NACA 2412</span></label>
+            <div class="btn-row" style="margin-top: 0;">
+                <button id="btn_geom_naca" class="active">NACA</button>
+                <button id="btn_geom_jouk">Joukowski</button>
+            </div>
+        </div>
+        <div id="ctrl_naca" class="control-group">
+            <label>4-digit code</label>
+            <input type="text" id="in_naca" value="2412" maxlength="4">
+            <div class="btn-row" style="margin-top: 8px;">
+                <button class="naca-preset" data-naca="0012">0012</button>
+                <button class="naca-preset" data-naca="2412">2412</button>
+                <button class="naca-preset" data-naca="4412">4412</button>
+                <button class="naca-preset" data-naca="6409">6409</button>
+            </div>
+        </div>
+        <div id="ctrl_jouk" style="display:none;">
+            <div class="control-group">
+                <label>Thickness <span id="disp_thick" class="val-disp">0.12</span></label>
+                <input type="range" id="in_thick" min="0.02" max="0.25" step="0.01" value="0.12" data-geo="true">
+                <div class="slider-scale"><span>thin</span><span></span><span>thick</span></div>
+            </div>
+            <div class="control-group">
+                <label>Camber <span id="disp_camber" class="val-disp">0.10</span></label>
+                <input type="range" id="in_camber" min="-0.2" max="0.2" step="0.01" value="0.10" data-geo="true">
+                <div class="slider-scale"><span>−0.2</span><span>0</span><span>+0.2</span></div>
+            </div>
+        </div>
+
+        <h2 class="section">Visualization</h2>
+        <div class="control-group">
+            <label>Contrast <span id="disp_cont" class="val-disp">1.2</span></label>
+            <input type="range" id="in_cont" min="0.5" max="3.0" step="0.1" value="1.2">
+            <div class="slider-scale"><span>0.5×</span><span>1.7×</span><span>3.0×</span></div>
+        </div>
+        <div class="btn-row">
+            <button id="btn_view">Vorticity</button>
+            <button id="btn_particles">Particles</button>
+            <button id="btn_forces">Forces</button>
+        </div>
+
+        <h2 class="section">Simulation</h2>
+        <div class="btn-row">
+            <button id="btn_reset">Reset</button>
+            <button id="btn_pause">Pause</button>
+        </div>
+        <div class="btn-row" style="margin-top: 6px;">
+            <button id="btn_optimize">Optimize ↑ Cl</button>
+        </div>
+
+        <div class="stats" id="simStatus">
+            Steps: 0<br>
+            Inlet: 0.000 (target 0.10)<br>
+            Cl: +0.000   Cd: +0.000<br>
+            L/D: 0.0   Re: 0
+        </div>
+
+        <div class="hint">
+            <kbd>space</kbd> pause · <kbd>v</kbd> view · <kbd>p</kbd> particles<br>
+            <kbd>f</kbd> forces · <kbd>o</kbd> optimize · <kbd>r</kbd> reset
+        </div>
+    </div>
+
+<script>
+// ==========================================
+// 1. Configuration & Initialization
+// ==========================================
+const canvas = document.getElementById('simCanvas');
+const ctx = canvas.getContext('2d', { alpha: false });
+
+// Simulation Resolution (Fixed Grid)
+// We scale this up to fit the screen, keeping physics calculation manageable
+const simWidth = 400;
+const simHeight = 200;
+const N = simWidth * simHeight;
+
+// Render buffer (offscreen)
+const offCanvas = document.createElement('canvas');
+offCanvas.width = simWidth;
+offCanvas.height = simHeight;
+const offCtx = offCanvas.getContext('2d');
+const imgData = offCtx.createImageData(simWidth, simHeight);
+const px = imgData.data; // Raw pixel array
+
+// LBM D2Q9 Constants
+const w = new Float32Array([4/9, 1/9, 1/9, 1/9, 1/9, 1/36, 1/36, 1/36, 1/36]);
+const ex = new Int8Array([0, 1, 0, -1, 0, 1, -1, -1, 1]);
+const ey = new Int8Array([0, 0, 1, 0, -1, 1, 1, -1, -1]);
+const opposite = new Uint8Array([0, 3, 4, 1, 2, 7, 8, 5, 6]);
+
+// Simulation Arrays (Flat Float32 for performance)
+let f0 = new Float32Array(N * 9);
+let f1 = new Float32Array(N * 9);
+let rho = new Float32Array(N);
+let ux = new Float32Array(N);
+let uy = new Float32Array(N);
+let barrier = new Uint8Array(N); // 1 = solid, 0 = fluid
+
+// State Variables
+let paused = false;
+let stepCount = 0;
+let currentInletVel = 0.0;
+let airfoilPolygon = []; // Stores vector points for drawing
+let airfoilChord = 1;    // grid units, max extent of polygon
+let viewMode = 'speed';  // 'speed' or 'vorticity'
+let Fx_accum = 0, Fy_accum = 0;
+let Cl = 0, Cd = 0;      // smoothed lift / drag coefficients
+let geomMode = 'naca';   // 'naca' or 'joukowski'
+let nacaCode = '2412';
+
+// Bouzidi interpolated bounce-back: q[i*9+k] = fractional distance from fluid
+// node i to the airfoil wall along link e_k, in lattice spacing units. -1 means
+// "no airfoil along this link" (use straight streaming).
+let qData = new Float32Array(N * 9);
+
+// Particle tracers
+const numParticles = 1500;
+let particles = []; // {x, y, age}
+let particlesEnabled = false;
+
+// Stability
+let unstable = false;
+
+// Force / chord overlay
+let forcesEnabled = false;
+let airfoilLE = { x: 0, y: 0 };
+let airfoilTE = { x: 0, y: 0 };
+
+// Shape optimizer (hill-climb on NACA digits + AoA, keeping flow conditions fixed)
+const optimizer = {
+    active: false,
+    phase: 'idle',      // 'settle' | 'measure'
+    iter: 0,
+    maxIter: 30,
+    settleFrames: 0,
+    settleTarget: 75,   // frames before measurement
+    measureFrames: 0,
+    measureTarget: 35,
+    sumCl: 0,
+    sumCd: 0,
+    best: null,         // { code, aoa, cl, cd }
+    trial: null
+};
+
+// Parameters
+const params = {
+    speed: 0.1,
+    viscosity: 0.02,
+    aoa: 15,
+    thickness: 0.12,
+    camber: 0.1,
+    contrast: 1.2,
+    smagorinsky: 0.12 // LES constant
+};
+
+// ==========================================
+// 2. The Solver (Physics Engine)
+// ==========================================
+
+function initFluid() {
+    // Initialize fluid at rest with density 1
+    for (let i = 0; i < N; i++) {
+        rho[i] = 1.0;
+        ux[i] = 0.0;
+        uy[i] = 0.0;
+        for (let k = 0; k < 9; k++) {
+            f0[i*9 + k] = w[k];
+            f1[i*9 + k] = w[k];
+        }
+    }
+    currentInletVel = 0.0;
+    stepCount = 0;
+}
+
+// Parse a NACA 4-digit designator (e.g. "2412"). Returns null on invalid input.
+function parseNaca(code) {
+    code = String(code).trim();
+    if (!/^\d{4}$/.test(code)) return null;
+    const m = parseInt(code[0], 10) / 100;        // max camber as fraction of chord
+    const p = parseInt(code[1], 10) / 10;         // position of max camber
+    const t = parseInt(code.substring(2, 4), 10) / 100; // max thickness
+    if (t < 0.01) return null;
+    return { m, p, t };
+}
+
+// NACA 4-digit airfoil boundary, normalized to chord = 1 with leading edge at x = 0.
+// Returns a closed polygon (no duplicated LE / TE vertices), upper LE→TE then lower TE→LE.
+function buildNacaPoints(m, p, t) {
+    const N = 100;
+    const upper = [], lower = [];
+    for (let i = 0; i <= N; i++) {
+        // Cosine spacing — denser near LE / TE where curvature is highest.
+        const beta = i * Math.PI / N;
+        const x = 0.5 * (1 - Math.cos(beta));
+        const sx = Math.sqrt(x);
+        // Closed-trailing-edge thickness (Abbott & von Doenhoff, last coef tweaked from -0.1015).
+        const yt = (t / 0.2) * (0.2969 * sx
+                              - 0.1260 * x
+                              - 0.3516 * x * x
+                              + 0.2843 * x * x * x
+                              - 0.1036 * x * x * x * x);
+        let yc = 0, dyc = 0;
+        if (m > 0 && p > 0 && p < 1) {
+            if (x < p) {
+                yc  = (m / (p * p)) * (2 * p * x - x * x);
+                dyc = (2 * m / (p * p)) * (p - x);
+            } else {
+                const q = 1 - p;
+                yc  = (m / (q * q)) * ((1 - 2 * p) + 2 * p * x - x * x);
+                dyc = (2 * m / (q * q)) * (p - x);
+            }
+        }
+        const theta = Math.atan(dyc);
+        const st = Math.sin(theta);
+        const ct = Math.cos(theta);
+        upper.push({ x: x - yt * st, y: yc + yt * ct });
+        lower.push({ x: x + yt * st, y: yc - yt * ct });
+    }
+    const pts = [];
+    for (let i = 0; i < upper.length; i++) pts.push(upper[i]); // LE → TE
+    for (let i = lower.length - 2; i >= 1; i--) pts.push(lower[i]); // TE → LE, skip duplicates
+    return pts;
+}
+
+// Joukowski airfoil from the circle (cx, cy) with radius set to pass through (1, 0),
+// mapped via w = z + 1/z.
+function buildJoukowskiPoints(thickness, camber) {
+    const cx = -thickness;
+    const cy = camber;
+    const r = Math.sqrt((1 - cx) * (1 - cx) + cy * cy);
+    const pts = [];
+    const steps = 180;
+    for (let i = 0; i <= steps; i++) {
+        const theta = (i / steps) * 2 * Math.PI;
+        const zx = cx + r * Math.cos(theta);
+        const zy = cy + r * Math.sin(theta);
+        let den = zx * zx + zy * zy;
+        if (den < 0.0001) den = 0.0001;
+        pts.push({
+            x: zx * (1 + 1 / den),
+            y: zy * (1 - 1 / den)
+        });
+    }
+    return pts;
+}
+
+function buildGeometry() {
+    barrier.fill(0);
+
+    // Channel walls
+    for (let x = 0; x < simWidth; x++) {
+        barrier[x] = 1;
+        barrier[x + (simHeight - 1) * simWidth] = 1;
+    }
+
+    const angRad = -params.aoa * (Math.PI / 180);
+    const centerX = simWidth * 0.25;
+    const centerY = simHeight * 0.5;
+
+    // Pick generator, scale (chord ≈ 120 grid units in either mode), and pivot.
+    let basePoints, scale, xShift;
+    if (geomMode === 'naca') {
+        const n = parseNaca(nacaCode);
+        if (!n) {
+            airfoilPolygon = [];
+            airfoilChord = 1;
+            return;
+        }
+        basePoints = buildNacaPoints(n.m, n.p, n.t);
+        scale = 120;
+        xShift = -0.25; // rotate about quarter-chord (aerodynamic center)
+    } else {
+        basePoints = buildJoukowskiPoints(params.thickness, params.camber);
+        scale = 30;
+        xShift = 0;
+    }
+
+    airfoilPolygon = [];
+    const cosA = Math.cos(angRad);
+    const sinA = Math.sin(angRad);
+    for (const p of basePoints) {
+        const lx = p.x + xShift;
+        const ly = p.y;
+        const rx = lx * cosA - ly * sinA;
+        const ry = lx * sinA + ly * cosA;
+        airfoilPolygon.push({
+            x: centerX + rx * scale,
+            y: centerY - ry * scale // flip Y for screen coords
+        });
+    }
+
+    // Rasterize polygon to barrier grid
+    let minX = simWidth, maxX = 0, minY = simHeight, maxY = 0;
+    for (const p of airfoilPolygon) {
+        if (p.x < minX) minX = p.x;
+        if (p.x > maxX) maxX = p.x;
+        if (p.y < minY) minY = p.y;
+        if (p.y > maxY) maxY = p.y;
+    }
+    minX = Math.floor(Math.max(0, minX));
+    maxX = Math.ceil(Math.min(simWidth - 1, maxX));
+    minY = Math.floor(Math.max(0, minY));
+    maxY = Math.ceil(Math.min(simHeight - 1, maxY));
+
+    for (let y = minY; y <= maxY; y++) {
+        for (let x = minX; x <= maxX; x++) {
+            if (isInside(x, y, airfoilPolygon)) {
+                const idx = x + y * simWidth;
+                if (barrier[idx] === 0) {
+                    barrier[idx] = 2;
+                    ux[idx] = 0;
+                    uy[idx] = 0;
+                }
+            }
+        }
+    }
+
+    // Chord = max pairwise distance between polygon points (in grid units).
+    let chord2 = 0;
+    let leIdx = 0, teIdx = 0;
+    for (let i = 0; i < airfoilPolygon.length; i++) {
+        for (let j = i + 1; j < airfoilPolygon.length; j++) {
+            const dx = airfoilPolygon[i].x - airfoilPolygon[j].x;
+            const dy = airfoilPolygon[i].y - airfoilPolygon[j].y;
+            const d2 = dx * dx + dy * dy;
+            if (d2 > chord2) { chord2 = d2; leIdx = i; teIdx = j; }
+        }
+    }
+    airfoilChord = Math.sqrt(chord2);
+    // Leading edge = upstream (lower screen x); trailing edge = downstream.
+    if (airfoilPolygon[leIdx].x > airfoilPolygon[teIdx].x) {
+        const tmp = leIdx; leIdx = teIdx; teIdx = tmp;
+    }
+    airfoilLE = airfoilPolygon[leIdx];
+    airfoilTE = airfoilPolygon[teIdx];
+
+    buildBoundaryData();
+}
+
+function isInside(x, y, poly) {
+    let inside = false;
+    for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+        let xi = poly[i].x, yi = poly[i].y;
+        let xj = poly[j].x, yj = poly[j].y;
+        let intersect = ((yi > y) != (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi);
+        if (intersect) inside = !inside;
+    }
+    return inside;
+}
+
+// Cast a ray from (x, y) along (dirX, dirY) and return the smallest t in [0, 1]
+// at which it intersects the closed airfoil polygon, or -1 if no hit. The
+// parameterization is (x + t*dirX, y + t*dirY), so t = q directly (the wall
+// fraction along the lattice link). Diagonal links share the same convention
+// since they're parameterized the same way.
+function rayPolygonQ(x, y, dirX, dirY) {
+    let minT = 2;
+    const poly = airfoilPolygon;
+    for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+        const p1 = poly[j], p2 = poly[i];
+        const sx = p2.x - p1.x;
+        const sy = p2.y - p1.y;
+        const denom = sx * dirY - sy * dirX;
+        if (denom > -1e-9 && denom < 1e-9) continue;
+        const inv = 1 / denom;
+        const dxp = p1.x - x;
+        const dyp = p1.y - y;
+        const t = (sx * dyp - sy * dxp) * inv;
+        const s = (dirX * dyp - dirY * dxp) * inv;
+        if (t >= 0 && t <= 1.0001 && s >= -1e-6 && s <= 1.0000001) {
+            if (t < minT) minT = t;
+        }
+    }
+    return minT > 1 ? -1 : minT;
+}
+
+// Build the q-table for every fluid-cell link that points into the airfoil.
+function buildBoundaryData() {
+    qData.fill(-1);
+    if (airfoilPolygon.length < 3) return;
+    for (let y = 1; y < simHeight - 1; y++) {
+        for (let x = 0; x < simWidth; x++) {
+            const i = x + y * simWidth;
+            if (barrier[i]) continue;
+            for (let k = 1; k < 9; k++) {
+                const nx = x + ex[k];
+                const ny = y + ey[k];
+                if (nx < 0 || nx >= simWidth || ny < 0 || ny >= simHeight) continue;
+                if (barrier[nx + ny * simWidth] !== 2) continue;
+                const q = rayPolygonQ(x, y, ex[k], ey[k]);
+                qData[i * 9 + k] = (q > 0 && q <= 1) ? q : 0.5; // fallback to midpoint if degenerate
+            }
+        }
+    }
+}
+
+function initParticles() {
+    particles = new Array(numParticles);
+    for (let i = 0; i < numParticles; i++) {
+        particles[i] = {
+            x: Math.random() * simWidth * 0.4,
+            y: 1 + Math.random() * (simHeight - 2),
+            age: Math.random() * 400
+        };
+    }
+}
+
+function respawnParticle(p) {
+    p.x = Math.random() * 3;
+    p.y = 1 + Math.random() * (simHeight - 2);
+    p.age = 0;
+}
+
+function advectParticles() {
+    // Integrate over the same wall-clock interval as 8 LBM substeps per frame.
+    const dt = 8;
+    const maxAge = 800;
+    for (let n = 0; n < particles.length; n++) {
+        const p = particles[n];
+        const ix = Math.floor(p.x);
+        const iy = Math.floor(p.y);
+        if (ix < 0 || ix >= simWidth - 1 || iy < 0 || iy >= simHeight - 1) {
+            respawnParticle(p);
+            continue;
+        }
+        const fx = p.x - ix;
+        const fy = p.y - iy;
+        const i00 = ix + iy * simWidth;
+        // Bilinear-interpolated velocity
+        const u = (1 - fx) * (1 - fy) * ux[i00]
+                + fx       * (1 - fy) * ux[i00 + 1]
+                + (1 - fx) * fy       * ux[i00 + simWidth]
+                + fx       * fy       * ux[i00 + simWidth + 1];
+        const v = (1 - fx) * (1 - fy) * uy[i00]
+                + fx       * (1 - fy) * uy[i00 + 1]
+                + (1 - fx) * fy       * uy[i00 + simWidth]
+                + fx       * fy       * uy[i00 + simWidth + 1];
+        p.x += u * dt;
+        p.y += v * dt;
+        p.age++;
+        const cellIdx = (p.x | 0) + (p.y | 0) * simWidth;
+        if (cellIdx >= 0 && cellIdx < N && barrier[cellIdx] === 2) {
+            respawnParticle(p);
+            continue;
+        }
+        if (p.age > maxAge) respawnParticle(p);
+    }
+}
+
+// Cheap stability probe: walk a stride of cells looking for NaN or supersonic
+// velocity. Returns true if the field is healthy.
+function checkStability() {
+    for (let i = 0; i < N; i += 23) {
+        const u = ux[i], v = uy[i];
+        if (u !== u || v !== v) return false; // NaN check
+        if (u * u + v * v > 0.25) return false;
+    }
+    return true;
+}
+
+function drawArrow(ctx, x1, y1, x2, y2, color, width) {
+    const dx = x2 - x1, dy = y2 - y1;
+    const len = Math.sqrt(dx*dx + dy*dy);
+    if (len < 1) return;
+    ctx.strokeStyle = color;
+    ctx.fillStyle = color;
+    ctx.lineWidth = width || 2;
+    ctx.beginPath();
+    ctx.moveTo(x1, y1);
+    ctx.lineTo(x2, y2);
+    ctx.stroke();
+    const angle = Math.atan2(dy, dx);
+    const head = Math.min(10, len * 0.5);
+    ctx.beginPath();
+    ctx.moveTo(x2, y2);
+    ctx.lineTo(x2 - head * Math.cos(angle - 0.5), y2 - head * Math.sin(angle - 0.5));
+    ctx.lineTo(x2 - head * Math.cos(angle + 0.5), y2 - head * Math.sin(angle + 0.5));
+    ctx.closePath();
+    ctx.fill();
+}
+
+// ---------- Shape optimizer ----------
+// Stochastic hill-climber over NACA digits + angle of attack. Flow conditions
+// (speed, viscosity) are held fixed — the optimizer only changes the wing.
+// Each trial: settle the flow, average Cl over a window, accept if better.
+
+function applyOptParams(p) {
+    nacaCode = p.code;
+    params.aoa = p.aoa;
+    document.getElementById('in_naca').value = p.code;
+    document.getElementById('in_aoa').value = p.aoa;
+    document.getElementById('disp_aoa').innerText = p.aoa + '°';
+    updateGeomDisplay();
+    buildGeometry();
+}
+
+function perturbParams(base) {
+    let m = parseInt(base.code[0], 10);
+    let pp = parseInt(base.code[1], 10);
+    let t = parseInt(base.code.substring(2, 4), 10);
+    let aoa = base.aoa;
+    // AoA has the biggest single-step effect, so bias toward it.
+    const r = Math.random();
+    const step = Math.random() < 0.5 ? -1 : 1;
+    if (r < 0.45) {
+        aoa = Math.max(-25, Math.min(25, aoa + step));
+    } else if (r < 0.7) {
+        m = Math.max(0, Math.min(9, m + step));
+        if (m === 0) pp = 0;
+        else if (pp === 0) pp = 4;
+    } else if (r < 0.85) {
+        if (m > 0) pp = Math.max(1, Math.min(9, pp + step));
+    } else {
+        t = Math.max(4, Math.min(24, t + step));
+    }
+    const tStr = t < 10 ? '0' + t : '' + t;
+    return { code: '' + m + pp + tStr, aoa };
+}
+
+function setOptimizerLock(locked) {
+    // While the optimizer is running, user edits to geometry/AoA would just be
+    // overwritten on the next trial — disable them so the lock is visible.
+    const ids = ['in_aoa', 'in_naca', 'btn_geom_naca', 'btn_geom_jouk', 'btn_reset', 'in_thick', 'in_camber'];
+    ids.forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.disabled = locked;
+    });
+    document.querySelectorAll('.naca-preset').forEach(b => { b.disabled = locked; });
+}
+
+function startOptimize() {
+    if (optimizer.active) { stopOptimize(); return; }
+    if (geomMode !== 'naca') setGeomMode('naca');
+    optimizer.active = true;
+    optimizer.iter = 0;
+    // Seed with current params; first trial will perturb from this.
+    optimizer.best = { code: nacaCode, aoa: params.aoa, cl: -Infinity, cd: 0 };
+    optimizer.trial = { code: nacaCode, aoa: params.aoa };
+    optimizer.phase = 'settle';
+    optimizer.settleFrames = 0;
+    optimizer.measureFrames = 0;
+    optimizer.sumCl = 0;
+    optimizer.sumCd = 0;
+    initFluid();
+    const btn = document.getElementById('btn_optimize');
+    btn.classList.add('active');
+    btn.innerText = 'Stop';
+    setOptimizerLock(true);
+}
+
+function stopOptimize() {
+    if (!optimizer.active) return;
+    optimizer.active = false;
+    if (optimizer.best && optimizer.best.cl > -Infinity) {
+        applyOptParams(optimizer.best);
+    }
+    const btn = document.getElementById('btn_optimize');
+    btn.classList.remove('active');
+    btn.innerText = 'Optimize ↑ Cl';
+    setOptimizerLock(false);
+}
+
+function nextTrial(revertNeeded) {
+    optimizer.iter++;
+    if (optimizer.iter >= optimizer.maxIter) {
+        stopOptimize();
+        return;
+    }
+    if (revertNeeded) applyOptParams(optimizer.best);
+    optimizer.trial = perturbParams(optimizer.best);
+    applyOptParams(optimizer.trial);
+    initFluid();
+    optimizer.phase = 'settle';
+    optimizer.settleFrames = 0;
+    optimizer.measureFrames = 0;
+    optimizer.sumCl = 0;
+    optimizer.sumCd = 0;
+}
+
+function tickOptimizer() {
+    if (!optimizer.active) return;
+    if (optimizer.phase === 'settle') {
+        optimizer.settleFrames++;
+        if (optimizer.settleFrames >= optimizer.settleTarget) {
+            optimizer.phase = 'measure';
+        }
+        return;
+    }
+    if (optimizer.phase === 'measure') {
+        if (unstable) {
+            // Candidate diverged — recover and reject it as a worse-than-best trial.
+            unstable = false;
+            paused = false;
+            initFluid();
+            nextTrial(true);
+            return;
+        }
+        optimizer.measureFrames++;
+        optimizer.sumCl += Cl;
+        optimizer.sumCd += Cd;
+        if (optimizer.measureFrames >= optimizer.measureTarget) {
+            const avgCl = optimizer.sumCl / optimizer.measureTarget;
+            const avgCd = optimizer.sumCd / optimizer.measureTarget;
+            const better = avgCl > optimizer.best.cl;
+            if (better) {
+                optimizer.best = {
+                    code: optimizer.trial.code,
+                    aoa: optimizer.trial.aoa,
+                    cl: avgCl,
+                    cd: avgCd
+                };
+            }
+            nextTrial(!better);
+        }
+    }
+}
+
+function getEquilibrium(rho, u, v, i) {
+    const cu = 3.0 * (ex[i] * u + ey[i] * v);
+    const u2 = 1.5 * (u * u + v * v);
+    return rho * w[i] * (1.0 + cu + 0.5 * cu * cu - u2);
+}
+
+function solve() {
+    // Ramp inlet velocity
+    if(currentInletVel < params.speed) {
+        currentInletVel += 0.0005;
+    } else if(currentInletVel > params.speed) {
+        currentInletVel -= 0.0005; // Allow ramping down
+    }
+
+    // Zou-He west inlet: enforce (u_in, 0) by reconstructing the unknown
+    // distributions f1, f5, f8 from the post-streaming f's. Density is computed
+    // from the closure rho = (f0+f2+f4 + 2(f3+f6+f7)) / (1 - u_in), which
+    // conserves mass — unlike the previous "rho = 1" override.
+    {
+        const u_in = currentInletVel;
+        const denom = 1.0 - u_in;
+        if (denom > 1e-6) {
+            for (let y = 1; y < simHeight - 1; y++) {
+                const i = y * simWidth; // x = 0
+                if (barrier[i]) continue;
+                const off = i * 9;
+                const f_0 = f0[off + 0];
+                const f_2 = f0[off + 2];
+                const f_3 = f0[off + 3];
+                const f_4 = f0[off + 4];
+                const f_6 = f0[off + 6];
+                const f_7 = f0[off + 7];
+                const rho_in = (f_0 + f_2 + f_4 + 2 * (f_3 + f_6 + f_7)) / denom;
+                const ru = rho_in * u_in;
+                f0[off + 1] = f_3 + (2.0 / 3.0) * ru;
+                f0[off + 5] = f_7 - 0.5 * (f_2 - f_4) + ru / 6.0;
+                f0[off + 8] = f_6 + 0.5 * (f_2 - f_4) + ru / 6.0;
+            }
+        }
+    }
+
+    // Pre-compute relaxation
+    // Smagorinsky LES: Tau is local, not constant.
+    // We base tau_0 on viscosity input.
+    const tau_0 = 3.0 * params.viscosity + 0.5;
+
+    for (let y = 0; y < simHeight; y++) {
+        for (let x = 0; x < simWidth; x++) {
+            const i = x + y * simWidth;
+            const offset = i * 9;
+
+            if (barrier[i]) continue;
+
+            // 1. Macroscopic moments (fused: rho, rho*u, rho*v in one pass)
+            let r = 0, u = 0, v = 0;
+            for (let k = 0; k < 9; k++) {
+                const fk = f0[offset + k];
+                r += fk;
+                u += fk * ex[k];
+                v += fk * ey[k];
+            }
+            u /= r;
+            v /= r;
+
+            // Store for viz
+            rho[i] = r;
+            ux[i] = u;
+            uy[i] = v;
+
+            // 2. LES Turbulence Calculation (Smagorinsky)
+            // Calculate Non-Equilibrium Strain Tensor
+            let Qxx = 0, Qxy = 0, Qyy = 0;
+            for(let k=0; k<9; k++) {
+                const feq = getEquilibrium(r, u, v, k);
+                const fneq = f0[offset+k] - feq;
+                Qxx += ex[k] * ex[k] * fneq;
+                Qxy += ex[k] * ey[k] * fneq;
+                Qyy += ey[k] * ey[k] * fneq;
+            }
+            
+            // Strain magnitude
+            const Pi = Math.sqrt(Qxx*Qxx + 2*Qxy*Qxy + Qyy*Qyy);
+            // Eddy viscosity addition
+            const C = params.smagorinsky;
+            // Effective Tau logic
+            const tau_add = 0.5 * (Math.sqrt(tau_0*tau_0 + 18.0 * C*C * Pi / r) - tau_0);
+            const omega = 1.0 / (tau_0 + tau_add);
+
+            // 3. Collision
+            for (let k = 0; k < 9; k++) {
+                const feq = getEquilibrium(r, u, v, k);
+                // TRT or BGK collision
+                f0[offset+k] = f0[offset+k] * (1.0 - omega) + feq * omega;
+            }
+        }
+    }
+
+    // 4. Streaming & Boundary Conditions. We also integrate momentum exchange
+    // on airfoil bounce-back to get instantaneous lift / drag.
+    let fx = 0, fy = 0;
+    for (let y = 0; y < simHeight; y++) {
+        for (let x = 0; x < simWidth; x++) {
+            const i = x + y * simWidth;
+            if(barrier[i]) continue;
+
+            for(let k=0; k<9; k++) {
+                const nextX = x + ex[k];
+                const nextY = y + ey[k];
+
+                if(nextX >= 0 && nextX < simWidth && nextY >= 0 && nextY < simHeight) {
+                    const nextI = nextX + nextY * simWidth;
+                    const b = barrier[nextI];
+                    if (b === 0) {
+                        f1[nextI*9 + k] = f0[i*9 + k];
+                    } else if (b === 2) {
+                        // Bouzidi interpolated bounce-back on airfoil
+                        const f_k = f0[i*9 + k];
+                        const q = qData[i*9 + k];
+                        let f_back;
+                        if (q >= 0.5) {
+                            const f_opp = f0[i*9 + opposite[k]];
+                            f_back = (f_k + (2.0*q - 1.0) * f_opp) / (2.0*q);
+                        } else if (q > 0) {
+                            const bx = x - ex[k];
+                            const by = y - ey[k];
+                            if (bx >= 0 && bx < simWidth && by >= 0 && by < simHeight) {
+                                const bi = bx + by * simWidth;
+                                if (!barrier[bi]) {
+                                    f_back = 2.0*q * f_k + (1.0 - 2.0*q) * f0[bi*9 + opposite[k]];
+                                } else {
+                                    f_back = f_k;
+                                }
+                            } else {
+                                f_back = f_k;
+                            }
+                        } else {
+                            f_back = f_k; // no q stored — shouldn't happen, fallback
+                        }
+                        f1[i*9 + opposite[k]] = f_back;
+                        // Momentum exchange: F_link = (f_pre + f_post) * e_k
+                        fx += (f_k + f_back) * ex[k];
+                        fy += (f_k + f_back) * ey[k];
+                    } else {
+                        // Channel wall — half-way BB, no force tally
+                        f1[i*9 + opposite[k]] = f0[i*9 + k];
+                    }
+                }
+                // Out-of-domain (e.g. nextX >= simWidth at outlet): particles leave.
+            }
+        }
+    }
+    Fx_accum = fx;
+    Fy_accum = fy;
+
+    // Outlet Correction (West side handled by Macro override, East side extrapolation)
+    for(let y=1; y<simHeight-1; y++) {
+        const end = (simWidth-1) + y*simWidth;
+        const pre = (simWidth-2) + y*simWidth;
+        for(let k=0; k<9; k++) f1[end*9+k] = f1[pre*9+k];
+    }
+
+    // Swap
+    let temp = f0; f0 = f1; f1 = temp;
+    stepCount++;
+
+    // Aerodynamic coefficients. Screen y is flipped, so lift (physical up) = -Fy.
+    // Denominator is q_inf * c (per unit span), with rho_inf ≈ 1 in LBM units.
+    const q = 0.5 * currentInletVel * currentInletVel;
+    if (q > 1e-6 && airfoilChord > 0) {
+        const denom = q * airfoilChord;
+        let cl_now = -Fy_accum / denom;
+        let cd_now =  Fx_accum / denom;
+        if (cl_now >  10) cl_now =  10; else if (cl_now < -10) cl_now = -10;
+        if (cd_now >  10) cd_now =  10; else if (cd_now < -10) cd_now = -10;
+        Cl = 0.95 * Cl + 0.05 * cl_now;
+        Cd = 0.95 * Cd + 0.05 * cd_now;
+    }
+}
+
+// ==========================================
+// 3. Visualization (Turbo Colormap + Vector Overlay)
+// ==========================================
+
+// Simple implementation of "Turbo" colormap logic for JS
+function colorMap(t) {
+    // Clamp t [0,1]
+    t = Math.max(0, Math.min(1, t));
+
+    // Approximate Turbo/Jet gradient
+    // Low(Blue) -> Mid(Green) -> High(Red)
+    // Custom interpolated palette
+    const r = Math.min(1, Math.max(0, 1.5 - Math.abs(4 * t - 3)));
+    const g = Math.min(1, Math.max(0, 1.5 - Math.abs(4 * t - 2)));
+    const b = Math.min(1, Math.max(0, 1.5 - Math.abs(4 * t - 1)));
+
+    // Adjust for dark background (make it vibrant)
+    return [Math.floor(r*255), Math.floor(g*255), Math.floor(b*255)];
+}
+
+// Diverging colormap (RdBu-like) for signed scalars such as vorticity.
+// t in [-1, 1]: -1 -> blue, 0 -> light, +1 -> red.
+function divergingColor(t, out) {
+    if (t > 1) t = 1; else if (t < -1) t = -1;
+    if (t >= 0) {
+        out[0] = (247 + (178 - 247) * t) | 0;
+        out[1] = (247 + ( 24 - 247) * t) | 0;
+        out[2] = (247 + ( 43 - 247) * t) | 0;
+    } else {
+        const a = -t;
+        out[0] = (247 + ( 33 - 247) * a) | 0;
+        out[1] = (247 + (102 - 247) * a) | 0;
+        out[2] = (247 + (172 - 247) * a) | 0;
+    }
+}
+
+// Renders a small colorbar at the bottom-left of the canvas so the user can
+// decode what the current view mode's colors mean.
+function drawColorLegend(ctx2d, canvasWidth, canvasHeight) {
+    const lgX = 20;
+    const lgY = canvasHeight - 50;
+    const lgW = 200;
+    const lgH = 12;
+
+    let title, leftLabel, midLabel, rightLabel;
+    let diverging = false;
+
+    if (viewMode === 'speed') {
+        title = 'Speed |u|  (lattice units)';
+        const refSpeed = (params.speed * 2) / Math.max(params.contrast, 0.01);
+        leftLabel  = '0';
+        midLabel   = (refSpeed * 0.5).toFixed(2);
+        rightLabel = '≥ ' + refSpeed.toFixed(2);
+    } else if (viewMode === 'vorticity') {
+        title = 'Vorticity ω  (CW · 0 · CCW)';
+        diverging = true;
+        const vortMax = 0.05 / Math.max(params.contrast, 0.01);
+        leftLabel  = '−' + vortMax.toFixed(3);
+        midLabel   = '0';
+        rightLabel = '+' + vortMax.toFixed(3);
+    } else {
+        title = 'Pressure coefficient Cp';
+        diverging = true;
+        const cpMax = 2 / Math.max(params.contrast, 0.01);
+        leftLabel  = '−' + cpMax.toFixed(1) + ' (suction)';
+        midLabel   = '0';
+        rightLabel = '+' + cpMax.toFixed(1) + ' (comp.)';
+    }
+
+    // Background plate for legibility on top of the colored fluid field
+    ctx2d.fillStyle = 'rgba(0, 0, 0, 0.55)';
+    ctx2d.fillRect(lgX - 10, lgY - 20, lgW + 20, lgH + 40);
+
+    // Gradient bar
+    const grad = ctx2d.createLinearGradient(lgX, 0, lgX + lgW, 0);
+    const steps = 32;
+    const tmp = [0, 0, 0];
+    for (let i = 0; i <= steps; i++) {
+        const t = i / steps;
+        let r, g, b;
+        if (diverging) {
+            divergingColor(t * 2 - 1, tmp);
+            r = tmp[0]; g = tmp[1]; b = tmp[2];
+        } else {
+            const c = colorMap(t);
+            r = c[0]; g = c[1]; b = c[2];
+        }
+        grad.addColorStop(t, `rgb(${r},${g},${b})`);
+    }
+    ctx2d.fillStyle = grad;
+    ctx2d.fillRect(lgX, lgY, lgW, lgH);
+    ctx2d.strokeStyle = 'rgba(255,255,255,0.35)';
+    ctx2d.lineWidth = 1;
+    ctx2d.strokeRect(lgX + 0.5, lgY + 0.5, lgW - 1, lgH - 1);
+
+    // Tick marks at quartiles inside the bar
+    ctx2d.strokeStyle = 'rgba(255,255,255,0.5)';
+    for (let q = 1; q < 4; q++) {
+        const xq = lgX + (lgW * q) / 4;
+        ctx2d.beginPath();
+        ctx2d.moveTo(xq, lgY + lgH - 4);
+        ctx2d.lineTo(xq, lgY + lgH);
+        ctx2d.stroke();
+    }
+
+    // Title above
+    ctx2d.fillStyle = '#eaeaea';
+    ctx2d.font = '11px sans-serif';
+    ctx2d.textAlign = 'left';
+    ctx2d.fillText(title, lgX, lgY - 6);
+
+    // Min / mid / max labels below
+    ctx2d.font = '10px monospace';
+    ctx2d.fillStyle = '#d0d0d0';
+    ctx2d.textAlign = 'left';
+    ctx2d.fillText(leftLabel, lgX, lgY + lgH + 13);
+    ctx2d.textAlign = 'center';
+    ctx2d.fillText(midLabel, lgX + lgW * 0.5, lgY + lgH + 13);
+    ctx2d.textAlign = 'right';
+    ctx2d.fillText(rightLabel, lgX + lgW, lgY + lgH + 13);
+    ctx2d.textAlign = 'left';
+}
+
+function draw() {
+    // 1. Render Fluid to Offscreen Buffer
+    const W = simWidth;
+    const H = simHeight;
+    if (viewMode === 'vorticity') {
+        // omega = dv/dx - du/dy via central differences. Scale chosen so a
+        // shed Karman vortex at default settings hits saturation.
+        const vortScale = 0.05 / params.contrast;
+        const tmp = [0, 0, 0];
+        for (let y = 0; y < H; y++) {
+            for (let x = 0; x < W; x++) {
+                const i = x + y * W;
+                if (barrier[i]) {
+                    px[i*4] = 40; px[i*4+1] = 40; px[i*4+2] = 40; px[i*4+3] = 255;
+                    continue;
+                }
+                let omega = 0;
+                if (x > 0 && x < W - 1 && y > 0 && y < H - 1) {
+                    omega = 0.5 * (
+                        (uy[(x+1) + y*W] - uy[(x-1) + y*W]) -
+                        (ux[x + (y+1)*W] - ux[x + (y-1)*W])
+                    );
+                }
+                divergingColor(omega / vortScale, tmp);
+                px[i*4]   = tmp[0];
+                px[i*4+1] = tmp[1];
+                px[i*4+2] = tmp[2];
+                px[i*4+3] = 255;
+            }
+        }
+    } else if (viewMode === 'pressure') {
+        // p = rho/3 in LBM. Plot deviation from freestream pressure, scaled so
+        // |Cp| ~ 2 saturates at default contrast (suction peak shows clearly).
+        const p_inf = 1.0 / 3.0;
+        const q_inf = 0.5 * Math.max(params.speed * params.speed, 1e-4);
+        const pScale = 2.0 * q_inf / params.contrast;
+        const tmp = [0, 0, 0];
+        for (let i = 0; i < N; i++) {
+            if (barrier[i]) {
+                px[i*4] = 40; px[i*4+1] = 40; px[i*4+2] = 40; px[i*4+3] = 255;
+                continue;
+            }
+            const dp = rho[i] / 3.0 - p_inf;
+            divergingColor(dp / pScale, tmp); // high pressure -> red, suction -> blue
+            px[i*4]   = tmp[0];
+            px[i*4+1] = tmp[1];
+            px[i*4+2] = tmp[2];
+            px[i*4+3] = 255;
+        }
+    } else {
+        for (let i = 0; i < N; i++) {
+            if (barrier[i]) {
+                px[i*4] = 40; px[i*4+1] = 40; px[i*4+2] = 40; px[i*4+3] = 255;
+            } else {
+                const u = ux[i];
+                const v = uy[i];
+                const speed = Math.sqrt(u*u + v*v);
+                const norm = (speed / (params.speed * 2.0)) * params.contrast;
+                const rgb = colorMap(norm);
+                px[i*4]   = rgb[0];
+                px[i*4+1] = rgb[1];
+                px[i*4+2] = rgb[2];
+                px[i*4+3] = 255;
+            }
+        }
+    }
+    offCtx.putImageData(imgData, 0, 0);
+
+    // 2. Draw to Main Canvas (Scale Up)
+    const width = canvas.width = canvas.clientWidth;
+    const height = canvas.height = canvas.clientHeight;
+    
+    // Draw fluid scaled
+    ctx.drawImage(offCanvas, 0, 0, simWidth, simHeight, 0, 0, width, height);
+
+    // 3. Draw Vector Airfoil Overlay
+    if(airfoilPolygon.length > 0) {
+        const scaleX = width / simWidth;
+        const scaleY = height / simHeight;
+
+        ctx.beginPath();
+        // Move to first point
+        ctx.moveTo(airfoilPolygon[0].x * scaleX, airfoilPolygon[0].y * scaleY);
+        for(let i=1; i<airfoilPolygon.length; i++) {
+            ctx.lineTo(airfoilPolygon[i].x * scaleX, airfoilPolygon[i].y * scaleY);
+        }
+        ctx.closePath();
+        
+        // Style
+        ctx.fillStyle = "#e0e0e0"; // Light Grey
+        ctx.fill();
+        ctx.strokeStyle = "#000";
+        ctx.lineWidth = 2;
+        ctx.stroke();
+
+        // Add specific "leading edge" highlight or fancy effect
+        ctx.shadowBlur = 10;
+        ctx.shadowColor = "rgba(0,0,0,0.5)";
+        ctx.shadowBlur = 0;
+    }
+
+    // 4. Particle tracers (drawn on top — they're passive markers of the flow)
+    if (particlesEnabled && particles.length > 0) {
+        const scaleX = width / simWidth;
+        const scaleY = height / simHeight;
+        const size = Math.max(1, Math.min(scaleX, scaleY) * 0.5);
+        ctx.fillStyle = 'rgba(255, 255, 255, 0.75)';
+        for (let n = 0; n < particles.length; n++) {
+            const p = particles[n];
+            const a = p.age;
+            if (a < 4 || a > 780) continue;
+            ctx.fillRect(p.x * scaleX - size * 0.5, p.y * scaleY - size * 0.5, size, size);
+        }
+    }
+
+    // 5. Chord + lift/drag overlay
+    if (forcesEnabled && airfoilChord > 0) {
+        const scaleX = width / simWidth;
+        const scaleY = height / simHeight;
+        const lex = airfoilLE.x * scaleX, ley = airfoilLE.y * scaleY;
+        const tex = airfoilTE.x * scaleX, tey = airfoilTE.y * scaleY;
+
+        // Chord line — dashed
+        ctx.setLineDash([5, 4]);
+        ctx.strokeStyle = '#ffd166';
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(lex, ley);
+        ctx.lineTo(tex, tey);
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        // Chord label at midpoint
+        const mx = (lex + tex) * 0.5;
+        const my = (ley + tey) * 0.5;
+        ctx.fillStyle = '#ffd166';
+        ctx.font = '11px monospace';
+        ctx.fillText('c = ' + airfoilChord.toFixed(0), tex + 6, tey + 4);
+
+        // Force vectors anchored at the airfoil's quarter-chord (closer to lift center
+        // than the geometric midpoint, and matches the pitch axis used in buildGeometry).
+        const qx = lex + (tex - lex) * 0.25;
+        const qy = ley + (tey - ley) * 0.25;
+        const armPerCl = airfoilChord * 0.5 * scaleX; // |Cl|=1 → half-chord arrow
+        const armPerCd = airfoilChord * 2.0 * scaleX; // 4x scale so Cd is visible
+
+        // Lift: perpendicular to freestream (+x), positive Cl → screen -y
+        const liftY = qy - Cl * armPerCl;
+        drawArrow(ctx, qx, qy, qx, liftY, '#4ade80', 2.5);
+        ctx.fillStyle = '#4ade80';
+        ctx.fillText('L  Cl=' + Cl.toFixed(2), qx + 6, Cl >= 0 ? liftY - 4 : liftY + 12);
+
+        // Drag: along freestream
+        const dragX = qx + Cd * armPerCd;
+        drawArrow(ctx, qx, qy, dragX, qy, '#ef4444', 2.5);
+        ctx.fillStyle = '#ef4444';
+        ctx.fillText('D  Cd=' + Cd.toFixed(3), dragX + 4, qy + 14);
+    }
+
+    // 6. Color legend — drawn last so it sits on top of everything.
+    drawColorLegend(ctx, width, height);
+}
+
+// ==========================================
+// 4. Main Loop & Interaction
+// ==========================================
+
+function loop() {
+    if(!paused && !unstable) {
+        for(let k=0; k<8; k++) solve();
+        if (!checkStability()) {
+            unstable = true;
+            // Don't pause if the optimizer is driving — let it reject this candidate.
+            if (!optimizer.active) {
+                paused = true;
+                const btn = document.getElementById('btn_pause');
+                btn.innerText = 'Resume';
+                btn.classList.add('active');
+            }
+        }
+        if (particlesEnabled) advectParticles();
+        tickOptimizer();
+    }
+    draw();
+
+    const LD = Math.abs(Cd) > 1e-3 ? (Cl / Cd) : 0;
+    const Re = params.viscosity > 1e-6
+        ? Math.round(currentInletVel * airfoilChord / params.viscosity)
+        : 0;
+    const sign = v => (v >= 0 ? '+' : '') + v.toFixed(3);
+    let html =
+        `Steps: ${stepCount}<br>` +
+        `Inlet: ${currentInletVel.toFixed(3)} (target ${params.speed.toFixed(2)})<br>` +
+        `Cl: ${sign(Cl)}   Cd: ${sign(Cd)}<br>` +
+        `L/D: ${LD.toFixed(1)}   Re: ${Re}`;
+    if (optimizer.active) {
+        const phaseTxt = optimizer.phase === 'settle'
+            ? `settling ${optimizer.settleFrames}/${optimizer.settleTarget}`
+            : `measuring ${optimizer.measureFrames}/${optimizer.measureTarget}`;
+        const bestCl = optimizer.best.cl > -Infinity ? optimizer.best.cl.toFixed(3) : '—';
+        html += `<br><span style="color:${'#00d2ff'}">Optimizer ${optimizer.iter}/${optimizer.maxIter} (${phaseTxt})<br>` +
+                `Trial: NACA ${optimizer.trial.code} α=${optimizer.trial.aoa}°<br>` +
+                `Best:  NACA ${optimizer.best.code} α=${optimizer.best.aoa}° Cl=${bestCl}</span>`;
+    } else if (unstable) {
+        html += `<br><span style="color:#ff6b6b">⚠ Unstable — lower speed or raise viscosity, then Reset.</span>`;
+    }
+    document.getElementById('simStatus').innerHTML = html;
+
+    requestAnimationFrame(loop);
+}
+
+// UI Event Listeners
+function updateParams() {
+    params.speed = parseFloat(document.getElementById('in_speed').value);
+    params.viscosity = parseFloat(document.getElementById('in_visc').value);
+    params.aoa = parseFloat(document.getElementById('in_aoa').value);
+    params.thickness = parseFloat(document.getElementById('in_thick').value);
+    params.camber = parseFloat(document.getElementById('in_camber').value);
+    params.contrast = parseFloat(document.getElementById('in_cont').value);
+
+    // Update display text
+    document.getElementById('disp_speed').innerText = params.speed.toFixed(2);
+    document.getElementById('disp_visc').innerText = params.viscosity.toFixed(3);
+    document.getElementById('disp_aoa').innerText = params.aoa + "°";
+    document.getElementById('disp_thick').innerText = params.thickness.toFixed(2);
+    document.getElementById('disp_camber').innerText = params.camber.toFixed(2);
+    document.getElementById('disp_cont').innerText = params.contrast.toFixed(1);
+}
+
+// Keyboard shortcuts — skip when the user is typing in a text/number input.
+document.addEventListener('keydown', (e) => {
+    const tag = e.target.tagName;
+    if (tag === 'INPUT' && e.target.type !== 'range') return;
+    const k = e.key.toLowerCase();
+    const map = {
+        ' ':       'btn_pause',
+        'spacebar':'btn_pause',
+        'v':       'btn_view',
+        'p':       'btn_particles',
+        'f':       'btn_forces',
+        'o':       'btn_optimize',
+        'r':       'btn_reset'
+    };
+    const id = map[k];
+    if (!id) return;
+    const el = document.getElementById(id);
+    if (!el || el.disabled) return;
+    e.preventDefault();
+    el.click();
+});
+
+// Initialization
+buildGeometry();
+initFluid();
+initParticles();
+
+// Listeners
+const inputs = document.querySelectorAll('input[type=range]');
+inputs.forEach(inp => {
+    inp.addEventListener('input', (e) => {
+        updateParams();
+        // If geometry changes, rebuild barrier immediately (Real-Time)
+        if(e.target.dataset.geo === "true") {
+            buildGeometry();
+        }
+    });
+});
+
+document.getElementById('btn_reset').addEventListener('click', () => {
+    initFluid();
+    buildGeometry();
+    initParticles();
+    Cl = 0; Cd = 0;
+    unstable = false;
+    paused = false;
+    const bp = document.getElementById('btn_pause');
+    bp.innerText = 'Pause';
+    bp.classList.remove('active');
+});
+
+document.getElementById('btn_pause').addEventListener('click', function() {
+    paused = !paused;
+    this.innerText = paused ? "Resume" : "Pause";
+    this.classList.toggle('active');
+});
+
+document.getElementById('btn_view').addEventListener('click', function() {
+    // Cycle speed -> vorticity -> pressure -> speed. Button text shows the NEXT mode.
+    if (viewMode === 'speed') {
+        viewMode = 'vorticity';
+        this.innerText = 'Pressure';
+    } else if (viewMode === 'vorticity') {
+        viewMode = 'pressure';
+        this.innerText = 'Speed';
+    } else {
+        viewMode = 'speed';
+        this.innerText = 'Vorticity';
+    }
+    this.classList.toggle('active', viewMode !== 'speed');
+});
+
+document.getElementById('btn_particles').addEventListener('click', function() {
+    particlesEnabled = !particlesEnabled;
+    this.classList.toggle('active', particlesEnabled);
+    if (particlesEnabled && particles.length === 0) initParticles();
+});
+
+document.getElementById('btn_forces').addEventListener('click', function() {
+    forcesEnabled = !forcesEnabled;
+    this.classList.toggle('active', forcesEnabled);
+});
+
+document.getElementById('btn_optimize').addEventListener('click', function() {
+    if (optimizer.active) stopOptimize();
+    else startOptimize();
+});
+
+function updateGeomDisplay() {
+    document.getElementById('disp_geom').innerText =
+        geomMode === 'naca' ? ('NACA ' + nacaCode) : 'Joukowski';
+}
+
+function setGeomMode(mode) {
+    geomMode = mode;
+    document.getElementById('btn_geom_naca').classList.toggle('active', mode === 'naca');
+    document.getElementById('btn_geom_jouk').classList.toggle('active', mode === 'joukowski');
+    document.getElementById('ctrl_naca').style.display = mode === 'naca' ? '' : 'none';
+    document.getElementById('ctrl_jouk').style.display = mode === 'joukowski' ? '' : 'none';
+    updateGeomDisplay();
+    buildGeometry();
+}
+
+document.getElementById('btn_geom_naca').addEventListener('click', () => setGeomMode('naca'));
+document.getElementById('btn_geom_jouk').addEventListener('click', () => setGeomMode('joukowski'));
+
+document.getElementById('in_naca').addEventListener('input', (e) => {
+    const v = e.target.value.replace(/\D/g, '').substring(0, 4);
+    e.target.value = v;
+    if (v.length === 4 && parseNaca(v)) {
+        nacaCode = v;
+        updateGeomDisplay();
+        if (geomMode === 'naca') buildGeometry();
+    }
+});
+
+document.querySelectorAll('.naca-preset').forEach(btn => {
+    btn.addEventListener('click', () => {
+        const code = btn.dataset.naca;
+        document.getElementById('in_naca').value = code;
+        nacaCode = code;
+        if (geomMode !== 'naca') {
+            setGeomMode('naca');
+        } else {
+            updateGeomDisplay();
+            buildGeometry();
+        }
+    });
+});
+
+// Start
+requestAnimationFrame(loop);
+
+</script>
+</body>
+</html>
