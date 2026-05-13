@@ -316,6 +316,7 @@
         </div>
 
         <div class="hint">
+            Drag the wing to rotate it.<br>
             <kbd>space</kbd> pause · <kbd>v</kbd> view · <kbd>p</kbd> particles<br>
             <kbd>f</kbd> forces · <kbd>o</kbd> optimize · <kbd>r</kbd> reset
         </div>
@@ -1405,6 +1406,94 @@ function updateParams() {
     document.getElementById('disp_camber').innerText = params.camber.toFixed(2);
     document.getElementById('disp_cont').innerText = params.contrast.toFixed(1);
 }
+
+// ============= Drag the wing to set Angle of Attack =============
+// Click on (or near) the airfoil and drag — the wing pivots about its
+// quarter-chord, the AoA slider follows in lockstep.
+let dragging = false;
+let dragInitial = { angle: 0, aoa: 0 };
+let lastCursor = '';
+function setCursor(c) {
+    if (lastCursor !== c) { canvas.style.cursor = c; lastCursor = c; }
+}
+
+function canvasEventPos(e) {
+    const rect = canvas.getBoundingClientRect();
+    return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+}
+
+function inGrabZone(canvasPt) {
+    if (airfoilPolygon.length < 3) return false;
+    const sX = canvas.clientWidth / simWidth;
+    const sY = canvas.clientHeight / simHeight;
+    const sx = canvasPt.x / sX;
+    const sy = canvasPt.y / sY;
+    const margin = 8; // grid cells of forgiveness
+    let minX = simWidth, maxX = 0, minY = simHeight, maxY = 0;
+    for (const q of airfoilPolygon) {
+        if (q.x < minX) minX = q.x; if (q.x > maxX) maxX = q.x;
+        if (q.y < minY) minY = q.y; if (q.y > maxY) maxY = q.y;
+    }
+    return sx >= minX - margin && sx <= maxX + margin &&
+           sy >= minY - margin && sy <= maxY + margin;
+}
+
+function airfoilPivotCanvas() {
+    const sX = canvas.clientWidth / simWidth;
+    const sY = canvas.clientHeight / simHeight;
+    // Geometry centers the airfoil at (simWidth*0.25, simHeight*0.5) and pitches
+    // it about that point (quarter-chord in NACA mode).
+    return { x: simWidth * 0.25 * sX, y: simHeight * 0.5 * sY };
+}
+
+canvas.addEventListener('mousedown', (e) => {
+    if (e.button !== 0) return;       // left-button only
+    if (optimizer.active) return;     // optimizer is driving — don't fight it
+    const p = canvasEventPos(e);
+    if (!inGrabZone(p)) return;
+    const pivot = airfoilPivotCanvas();
+    dragInitial.angle = Math.atan2(p.y - pivot.y, p.x - pivot.x);
+    dragInitial.aoa = params.aoa;
+    dragging = true;
+    setCursor('grabbing');
+    e.preventDefault();
+});
+
+window.addEventListener('mousemove', (e) => {
+    if (dragging) {
+        const p = canvasEventPos(e);
+        const pivot = airfoilPivotCanvas();
+        const angle = Math.atan2(p.y - pivot.y, p.x - pivot.x);
+        let dDeg = (angle - dragInitial.angle) * 180 / Math.PI;
+        // Unwrap across the ±180° seam so fast drags through 180° still feel continuous.
+        if (dDeg >  180) dDeg -= 360;
+        if (dDeg < -180) dDeg += 360;
+        let next = dragInitial.aoa + dDeg;
+        if (next >  45) next =  45;
+        if (next < -45) next = -45;
+        const rounded = Math.round(next);
+        if (rounded !== params.aoa) {
+            params.aoa = rounded;
+            document.getElementById('in_aoa').value = rounded;
+            document.getElementById('disp_aoa').innerText = rounded + '°';
+            buildGeometry();
+        }
+    } else {
+        // Hover cue: show the grab cursor when the mouse is over the wing.
+        const target = e.target;
+        if (target === canvas) {
+            setCursor(inGrabZone(canvasEventPos(e)) ? 'grab' : '');
+        } else if (lastCursor) {
+            setCursor('');
+        }
+    }
+});
+
+window.addEventListener('mouseup', () => {
+    if (!dragging) return;
+    dragging = false;
+    setCursor('');
+});
 
 // Keyboard shortcuts — skip when the user is typing in a text/number input.
 document.addEventListener('keydown', (e) => {
