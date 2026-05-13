@@ -294,7 +294,7 @@
             <div class="slider-scale"><span>0.5×</span><span>1.7×</span><span>3.0×</span></div>
         </div>
         <div class="btn-row">
-            <button id="btn_view">Vorticity</button>
+            <button id="btn_view">Speed</button>
             <button id="btn_particles">Particles</button>
             <button id="btn_forces">Forces</button>
         </div>
@@ -1464,17 +1464,12 @@ document.getElementById('btn_pause').addEventListener('click', function() {
 });
 
 document.getElementById('btn_view').addEventListener('click', function() {
-    // Cycle speed -> vorticity -> pressure -> speed. Button text shows the NEXT mode.
-    if (viewMode === 'speed') {
-        viewMode = 'vorticity';
-        this.innerText = 'Pressure';
-    } else if (viewMode === 'vorticity') {
-        viewMode = 'pressure';
-        this.innerText = 'Speed';
-    } else {
-        viewMode = 'speed';
-        this.innerText = 'Vorticity';
-    }
+    // Cycle speed -> vorticity -> pressure -> speed. Button label shows the
+    // CURRENT mode so it stays in lockstep with the legend.
+    if (viewMode === 'speed') viewMode = 'vorticity';
+    else if (viewMode === 'vorticity') viewMode = 'pressure';
+    else viewMode = 'speed';
+    this.innerText = viewMode.charAt(0).toUpperCase() + viewMode.slice(1);
     this.classList.toggle('active', viewMode !== 'speed');
 });
 
