@@ -284,7 +284,12 @@
                 <button class="naca-preset" data-naca="6409">6409</button>
             </div>
             <div class="btn-row" style="margin-top: 8px;">
-                <button id="btn_highlift">+ High-Lift (slat + flap)</button>
+                <button id="btn_flap">+ Flap</button>
+            </div>
+            <div id="ctrl_flap" style="display: none; margin-top: 10px;">
+                <label>Flap deflection <span id="disp_flapdef" class="val-disp">25°</span></label>
+                <input type="range" id="in_flapdef" min="0" max="45" step="1" value="25">
+                <div class="slider-scale"><span>0°</span><span>22°</span><span>45°</span></div>
             </div>
         </div>
         <div id="ctrl_jouk" style="display:none;">
@@ -382,8 +387,9 @@ let Fx_accum = 0, Fy_accum = 0;
 let Cl = 0, Cd = 0;      // smoothed lift / drag coefficients
 let geomMode = 'naca';   // 'naca' | 'joukowski' | 'cylinder'
 let nacaCode = '2412';
-let highLiftEnabled = false;     // adds a slat + flap to the main NACA element
-let extraPolygons = [];          // sub-element polygons (slat, flap) in screen coords
+let flapEnabled = false;         // adds a rear flap to the main NACA element
+let flapDeflectionDeg = 25;      // flap downward deflection, degrees
+let extraPolygons = [];          // sub-element polygons (flap) in screen coords
 
 // Bouzidi interpolated bounce-back: q[i*9+k] = fractional distance from fluid
 // node i to the airfoil wall along link e_k, in lattice spacing units. -1 means
@@ -646,23 +652,18 @@ function buildGeometry() {
         xShift = -0.25; // rotate about quarter-chord (aerodynamic centre)
     }
 
-    // Optional high-lift devices — slat ahead/below, flap behind/below.
-    // Only meaningful for the NACA main element (Joukowski / cylinder skip them).
+    // Optional rear flap — only meaningful for the NACA main element.
+    // Positive aerodynamic flap deflection rotates the flap TE downward, which
+    // in our deflectDeg convention (matches AoA sign, positive = LE up) is a
+    // NEGATIVE angle.
     const sublocals = []; // sub-element polygons still in main-wing-local frame
-    if (highLiftEnabled && geomMode === 'naca') {
-        const slatNaca = parseNaca('0008');
-        if (slatNaca) {
-            const slat = buildNacaPoints(slatNaca.m, slatNaca.p, slatNaca.t);
-            // Droop the slat 25° (LE down), at the wing's nose with a small slot.
-            sublocals.push(transformPoints(slat, 0.22, -25, 0.25, -0.05, -0.025));
-        }
+    if (flapEnabled && geomMode === 'naca') {
         const flapNaca = parseNaca('2410');
         if (flapNaca) {
             const flap = buildNacaPoints(flapNaca.m, flapNaca.p, flapNaca.t);
-            // Deflect the flap 25° downward (positive deflection in aero
-            // convention -> chord rotated clockwise -> negative deflectDeg
-            // here since deflectDeg matches AoA sign).
-            sublocals.push(transformPoints(flap, 0.30, -25, 0.0, 1.0, -0.03));
+            sublocals.push(
+                transformPoints(flap, 0.30, -flapDeflectionDeg, 0.0, 1.0, -0.03)
+            );
         }
     }
 
@@ -883,7 +884,7 @@ function perturbParams(base) {
 function setOptimizerLock(locked) {
     // While the optimizer is running, user edits to geometry/AoA would just be
     // overwritten on the next trial — disable them so the lock is visible.
-    const ids = ['in_aoa', 'in_naca', 'btn_geom_naca', 'btn_geom_jouk', 'btn_geom_cyl', 'btn_highlift', 'btn_reset', 'in_thick', 'in_camber'];
+    const ids = ['in_aoa', 'in_naca', 'btn_geom_naca', 'btn_geom_jouk', 'btn_geom_cyl', 'btn_flap', 'in_flapdef', 'btn_reset', 'in_thick', 'in_camber'];
     ids.forEach(id => {
         const el = document.getElementById(id);
         if (el) el.disabled = locked;
@@ -1532,7 +1533,10 @@ function encodeStateToHash() {
     qs.set('mode', geomMode);
     if (geomMode === 'naca') {
         qs.set('naca', nacaCode);
-        if (highLiftEnabled) qs.set('highlift', '1');
+        if (flapEnabled) {
+            qs.set('flap', '1');
+            qs.set('flapdef', String(flapDeflectionDeg));
+        }
     } else if (geomMode === 'joukowski') {
         qs.set('thick',  params.thickness.toFixed(2));
         qs.set('camber', params.camber.toFixed(2));
@@ -1565,7 +1569,12 @@ function decodeHashToState() {
     };
     const mode = qs.get('mode');
     if (mode === 'naca' || mode === 'joukowski' || mode === 'cylinder') geomMode = mode;
-    if (qs.get('highlift') === '1') highLiftEnabled = true;
+    // Accept both the new 'flap' key and the legacy 'highlift' key for back-compat.
+    if (qs.get('flap') === '1' || qs.get('highlift') === '1') flapEnabled = true;
+    if (qs.has('flapdef')) {
+        const fd = parseFloat(qs.get('flapdef'));
+        if (isFinite(fd)) flapDeflectionDeg = Math.max(0, Math.min(45, Math.round(fd)));
+    }
     if (qs.has('naca')) {
         const code = qs.get('naca');
         if (parseNaca(code)) nacaCode = code;
@@ -1602,7 +1611,10 @@ function syncUIFromState() {
     document.getElementById('btn_geom_cyl').classList.toggle('active', geomMode === 'cylinder');
     document.getElementById('ctrl_naca').style.display = geomMode === 'naca' ? '' : 'none';
     document.getElementById('ctrl_jouk').style.display = geomMode === 'joukowski' ? '' : 'none';
-    document.getElementById('btn_highlift').classList.toggle('active', highLiftEnabled);
+    document.getElementById('btn_flap').classList.toggle('active', flapEnabled);
+    document.getElementById('ctrl_flap').style.display = flapEnabled ? '' : 'none';
+    document.getElementById('in_flapdef').value = flapDeflectionDeg;
+    document.getElementById('disp_flapdef').innerText = flapDeflectionDeg + '°';
     const bv = document.getElementById('btn_view');
     bv.innerText = viewMode.charAt(0).toUpperCase() + viewMode.slice(1);
     bv.classList.toggle('active', viewMode !== 'speed');
@@ -2051,7 +2063,7 @@ function updateGeomDisplay() {
     let label;
     if (geomMode === 'cylinder') label = 'Cylinder';
     else if (geomMode === 'joukowski') label = 'Joukowski';
-    else label = 'NACA ' + nacaCode + (highLiftEnabled ? ' + slat/flap' : '');
+    else label = 'NACA ' + nacaCode + (flapEnabled ? (' + flap ' + flapDeflectionDeg + '°') : '');
     document.getElementById('disp_geom').innerText = label;
 }
 
@@ -2070,11 +2082,19 @@ document.getElementById('btn_geom_naca').addEventListener('click', () => setGeom
 document.getElementById('btn_geom_jouk').addEventListener('click', () => setGeomMode('joukowski'));
 document.getElementById('btn_geom_cyl').addEventListener('click', () => setGeomMode('cylinder'));
 
-document.getElementById('btn_highlift').addEventListener('click', function() {
-    highLiftEnabled = !highLiftEnabled;
-    this.classList.toggle('active', highLiftEnabled);
+document.getElementById('btn_flap').addEventListener('click', function() {
+    flapEnabled = !flapEnabled;
+    this.classList.toggle('active', flapEnabled);
+    document.getElementById('ctrl_flap').style.display = flapEnabled ? '' : 'none';
     updateGeomDisplay();
     buildGeometry();
+});
+
+document.getElementById('in_flapdef').addEventListener('input', (e) => {
+    flapDeflectionDeg = parseFloat(e.target.value);
+    document.getElementById('disp_flapdef').innerText = flapDeflectionDeg + '°';
+    updateGeomDisplay();
+    if (flapEnabled && geomMode === 'naca') buildGeometry();
 });
 
 document.getElementById('in_naca').addEventListener('input', (e) => {
