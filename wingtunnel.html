@@ -271,6 +271,7 @@
             <div class="btn-row" style="margin-top: 0;">
                 <button id="btn_geom_naca" class="active">NACA</button>
                 <button id="btn_geom_jouk">Joukowski</button>
+                <button id="btn_geom_cyl">Cylinder</button>
             </div>
         </div>
         <div id="ctrl_naca" class="control-group">
@@ -281,6 +282,9 @@
                 <button class="naca-preset" data-naca="2412">2412</button>
                 <button class="naca-preset" data-naca="4412">4412</button>
                 <button class="naca-preset" data-naca="6409">6409</button>
+            </div>
+            <div class="btn-row" style="margin-top: 8px;">
+                <button id="btn_highlift">+ High-Lift (slat + flap)</button>
             </div>
         </div>
         <div id="ctrl_jouk" style="display:none;">
@@ -376,8 +380,10 @@ let airfoilChord = 1;    // grid units, max extent of polygon
 let viewMode = 'speed';  // 'speed' or 'vorticity'
 let Fx_accum = 0, Fy_accum = 0;
 let Cl = 0, Cd = 0;      // smoothed lift / drag coefficients
-let geomMode = 'naca';   // 'naca' or 'joukowski'
+let geomMode = 'naca';   // 'naca' | 'joukowski' | 'cylinder'
 let nacaCode = '2412';
+let highLiftEnabled = false;     // adds a slat + flap to the main NACA element
+let extraPolygons = [];          // sub-element polygons (slat, flap) in screen coords
 
 // Bouzidi interpolated bounce-back: q[i*9+k] = fractional distance from fluid
 // node i to the airfoil wall along link e_k, in lattice spacing units. -1 means
@@ -531,6 +537,77 @@ function buildJoukowskiPoints(thickness, camber) {
     return pts;
 }
 
+// Cylinder — the canonical Kármán-vortex-street demo. Radius given in chord units
+// so the rest of the geometry pipeline (scale=120) gives a sane size.
+function buildCylinderPoints(radius) {
+    const pts = [];
+    const N = 96;
+    for (let i = 0; i < N; i++) {
+        const theta = (i / N) * 2 * Math.PI;
+        pts.push({ x: radius * Math.cos(theta), y: radius * Math.sin(theta) });
+    }
+    return pts;
+}
+
+// Apply local pivot/rotation/scale/translate to an array of (x,y) points.
+// Used to position sub-elements (slat / flap) inside the main-wing-local frame.
+function transformPoints(pts, chordFrac, deflectDeg, pivot, posX, posY) {
+    // deflectDeg uses the same sign convention as the main AoA (positive = LE up).
+    const ang = -deflectDeg * Math.PI / 180;
+    const cosA = Math.cos(ang), sinA = Math.sin(ang);
+    const out = new Array(pts.length);
+    for (let i = 0; i < pts.length; i++) {
+        const lx = (pts[i].x - pivot) * chordFrac;
+        const ly =  pts[i].y * chordFrac;
+        const rx = lx * cosA - ly * sinA;
+        const ry = lx * sinA + ly * cosA;
+        out[i] = { x: rx + posX, y: ry + posY };
+    }
+    return out;
+}
+
+// Take a polygon expressed in main-wing-local frame, apply the global
+// (xShift + main-AoA rotation + scale + translate + screen-y flip) transform.
+function placePolygon(localPts, cosA, sinA, scale, xShift, centerX, centerY) {
+    const out = new Array(localPts.length);
+    for (let i = 0; i < localPts.length; i++) {
+        const lx = localPts[i].x + xShift;
+        const ly = localPts[i].y;
+        const rx = lx * cosA - ly * sinA;
+        const ry = lx * sinA + ly * cosA;
+        out[i] = {
+            x: centerX + rx * scale,
+            y: centerY - ry * scale
+        };
+    }
+    return out;
+}
+
+// Rasterize a polygon's interior into the barrier grid (value = 2).
+function rasterizePolygon(poly) {
+    if (poly.length < 3) return;
+    let minX = simWidth, maxX = 0, minY = simHeight, maxY = 0;
+    for (const p of poly) {
+        if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
+        if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y;
+    }
+    minX = Math.floor(Math.max(0, minX));
+    maxX = Math.ceil(Math.min(simWidth - 1, maxX));
+    minY = Math.floor(Math.max(0, minY));
+    maxY = Math.ceil(Math.min(simHeight - 1, maxY));
+    for (let y = minY; y <= maxY; y++) {
+        for (let x = minX; x <= maxX; x++) {
+            if (isInside(x, y, poly)) {
+                const idx = x + y * simWidth;
+                if (barrier[idx] === 0) {
+                    barrier[idx] = 2;
+                    ux[idx] = 0; uy[idx] = 0;
+                }
+            }
+        }
+    }
+}
+
 function buildGeometry() {
     barrier.fill(0);
 
@@ -544,65 +621,62 @@ function buildGeometry() {
     const centerX = simWidth * 0.25;
     const centerY = simHeight * 0.5;
 
-    // Pick generator, scale (chord ≈ 120 grid units in either mode), and pivot.
-    let basePoints, scale, xShift;
-    if (geomMode === 'naca') {
+    // Pick the main generator, scale, and pivot.
+    let mainLocal, scale, xShift;
+    if (geomMode === 'cylinder') {
+        // Single circular bluff body. Radius 0.5 -> diameter 1 in chord units,
+        // matches scale=120 to give a ~120-grid-cell-diameter cylinder.
+        mainLocal = buildCylinderPoints(0.5);
+        scale = 120;
+        xShift = 0; // rotates about its centre (irrelevant — circles are isotropic)
+    } else if (geomMode === 'joukowski') {
+        mainLocal = buildJoukowskiPoints(params.thickness, params.camber);
+        scale = 30;
+        xShift = 0;
+    } else {
         const n = parseNaca(nacaCode);
         if (!n) {
             airfoilPolygon = [];
+            extraPolygons = [];
             airfoilChord = 1;
             return;
         }
-        basePoints = buildNacaPoints(n.m, n.p, n.t);
+        mainLocal = buildNacaPoints(n.m, n.p, n.t);
         scale = 120;
-        xShift = -0.25; // rotate about quarter-chord (aerodynamic center)
-    } else {
-        basePoints = buildJoukowskiPoints(params.thickness, params.camber);
-        scale = 30;
-        xShift = 0;
+        xShift = -0.25; // rotate about quarter-chord (aerodynamic centre)
     }
 
-    airfoilPolygon = [];
-    const cosA = Math.cos(angRad);
-    const sinA = Math.sin(angRad);
-    for (const p of basePoints) {
-        const lx = p.x + xShift;
-        const ly = p.y;
-        const rx = lx * cosA - ly * sinA;
-        const ry = lx * sinA + ly * cosA;
-        airfoilPolygon.push({
-            x: centerX + rx * scale,
-            y: centerY - ry * scale // flip Y for screen coords
-        });
-    }
-
-    // Rasterize polygon to barrier grid
-    let minX = simWidth, maxX = 0, minY = simHeight, maxY = 0;
-    for (const p of airfoilPolygon) {
-        if (p.x < minX) minX = p.x;
-        if (p.x > maxX) maxX = p.x;
-        if (p.y < minY) minY = p.y;
-        if (p.y > maxY) maxY = p.y;
-    }
-    minX = Math.floor(Math.max(0, minX));
-    maxX = Math.ceil(Math.min(simWidth - 1, maxX));
-    minY = Math.floor(Math.max(0, minY));
-    maxY = Math.ceil(Math.min(simHeight - 1, maxY));
-
-    for (let y = minY; y <= maxY; y++) {
-        for (let x = minX; x <= maxX; x++) {
-            if (isInside(x, y, airfoilPolygon)) {
-                const idx = x + y * simWidth;
-                if (barrier[idx] === 0) {
-                    barrier[idx] = 2;
-                    ux[idx] = 0;
-                    uy[idx] = 0;
-                }
-            }
+    // Optional high-lift devices — slat ahead/below, flap behind/below.
+    // Only meaningful for the NACA main element (Joukowski / cylinder skip them).
+    const sublocals = []; // sub-element polygons still in main-wing-local frame
+    if (highLiftEnabled && geomMode === 'naca') {
+        const slatNaca = parseNaca('0008');
+        if (slatNaca) {
+            const slat = buildNacaPoints(slatNaca.m, slatNaca.p, slatNaca.t);
+            // Droop the slat 25° (LE down), at the wing's nose with a small slot.
+            sublocals.push(transformPoints(slat, 0.22, -25, 0.25, -0.05, -0.025));
+        }
+        const flapNaca = parseNaca('2410');
+        if (flapNaca) {
+            const flap = buildNacaPoints(flapNaca.m, flapNaca.p, flapNaca.t);
+            // Deflect the flap 25° downward (positive deflection in aero
+            // convention -> chord rotated clockwise -> negative deflectDeg
+            // here since deflectDeg matches AoA sign).
+            sublocals.push(transformPoints(flap, 0.30, -25, 0.0, 1.0, -0.03));
         }
     }
 
-    // Chord = max pairwise distance between polygon points (in grid units).
+    // Place all local polygons into screen coords with the global transform.
+    const cosA = Math.cos(angRad);
+    const sinA = Math.sin(angRad);
+    airfoilPolygon = placePolygon(mainLocal, cosA, sinA, scale, xShift, centerX, centerY);
+    extraPolygons = sublocals.map(p => placePolygon(p, cosA, sinA, scale, xShift, centerX, centerY));
+
+    // Rasterize main + extras.
+    rasterizePolygon(airfoilPolygon);
+    for (const p of extraPolygons) rasterizePolygon(p);
+
+    // Chord (and LE/TE) refer to the MAIN element, even with high-lift devices.
     let chord2 = 0;
     let leIdx = 0, teIdx = 0;
     for (let i = 0; i < airfoilPolygon.length; i++) {
@@ -614,7 +688,6 @@ function buildGeometry() {
         }
     }
     airfoilChord = Math.sqrt(chord2);
-    // Leading edge = upstream (lower screen x); trailing edge = downstream.
     if (airfoilPolygon[leIdx].x > airfoilPolygon[teIdx].x) {
         const tmp = leIdx; leIdx = teIdx; teIdx = tmp;
     }
@@ -642,22 +715,25 @@ function isInside(x, y, poly) {
 // since they're parameterized the same way.
 function rayPolygonQ(x, y, dirX, dirY) {
     let minT = 2;
-    const poly = airfoilPolygon;
-    for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
-        const p1 = poly[j], p2 = poly[i];
-        const sx = p2.x - p1.x;
-        const sy = p2.y - p1.y;
-        const denom = sx * dirY - sy * dirX;
-        if (denom > -1e-9 && denom < 1e-9) continue;
-        const inv = 1 / denom;
-        const dxp = p1.x - x;
-        const dyp = p1.y - y;
-        const t = (sx * dyp - sy * dxp) * inv;
-        const s = (dirX * dyp - dirY * dxp) * inv;
-        if (t >= 0 && t <= 1.0001 && s >= -1e-6 && s <= 1.0000001) {
-            if (t < minT) minT = t;
+    function scan(poly) {
+        for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+            const p1 = poly[j], p2 = poly[i];
+            const sx = p2.x - p1.x;
+            const sy = p2.y - p1.y;
+            const denom = sx * dirY - sy * dirX;
+            if (denom > -1e-9 && denom < 1e-9) continue;
+            const inv = 1 / denom;
+            const dxp = p1.x - x;
+            const dyp = p1.y - y;
+            const t = (sx * dyp - sy * dxp) * inv;
+            const s = (dirX * dyp - dirY * dxp) * inv;
+            if (t >= 0 && t <= 1.0001 && s >= -1e-6 && s <= 1.0000001) {
+                if (t < minT) minT = t;
+            }
         }
     }
+    scan(airfoilPolygon);
+    for (const p of extraPolygons) scan(p);
     return minT > 1 ? -1 : minT;
 }
 
@@ -807,7 +883,7 @@ function perturbParams(base) {
 function setOptimizerLock(locked) {
     // While the optimizer is running, user edits to geometry/AoA would just be
     // overwritten on the next trial — disable them so the lock is visible.
-    const ids = ['in_aoa', 'in_naca', 'btn_geom_naca', 'btn_geom_jouk', 'btn_reset', 'in_thick', 'in_camber'];
+    const ids = ['in_aoa', 'in_naca', 'btn_geom_naca', 'btn_geom_jouk', 'btn_geom_cyl', 'btn_highlift', 'btn_reset', 'in_thick', 'in_camber'];
     ids.forEach(id => {
         const el = document.getElementById(id);
         if (el) el.disabled = locked;
@@ -1141,13 +1217,19 @@ function drawColorLegend(ctx2d, canvasWidth, canvasHeight) {
         leftLabel  = '−' + vortMax.toFixed(3);
         midLabel   = '0';
         rightLabel = '+' + vortMax.toFixed(3);
-    } else {
+    } else if (viewMode === 'pressure') {
         title = 'Pressure coefficient Cp';
         diverging = true;
         const cpMax = 2 / Math.max(params.contrast, 0.01);
         leftLabel  = '−' + cpMax.toFixed(1) + ' (suction)';
         midLabel   = '0';
         rightLabel = '+' + cpMax.toFixed(1) + ' (comp.)';
+    } else { // 'noise'
+        title = 'Lighthill source  ∂²Tij/∂xi∂xj  (log)';
+        diverging = true;
+        leftLabel  = 'sink';
+        midLabel   = 'quiet';
+        rightLabel = 'source';
     }
 
     // Background plate for legibility on top of the colored fluid field
@@ -1334,8 +1416,9 @@ function drawCpPlot(ctx2d, canvasWidth, canvasHeight) {
     const pts = cpCache;
     if (pts.length < 4) return;
 
-    const upper = pts.filter(p => p.upper && p.xc >= -0.05 && p.xc <= 1.05).sort((a,b) => a.xc - b.xc);
-    const lower = pts.filter(p => !p.upper && p.xc >= -0.05 && p.xc <= 1.05).sort((a,b) => a.xc - b.xc);
+    // Widened range so slat (xc ≲ 0) and flap (xc ≳ 1) data points are kept.
+    const upper = pts.filter(p => p.upper  && p.xc >= -0.4 && p.xc <= 1.5).sort((a,b) => a.xc - b.xc);
+    const lower = pts.filter(p => !p.upper && p.xc >= -0.4 && p.xc <= 1.5).sort((a,b) => a.xc - b.xc);
     if (upper.length + lower.length < 4) return;
 
     const pw = 240, ph = 130;
@@ -1347,7 +1430,7 @@ function drawCpPlot(ctx2d, canvasWidth, canvasHeight) {
     ctx2d.fillStyle = 'rgba(0, 0, 0, 0.55)';
     ctx2d.fillRect(px0 - 10, py0 - 22, pw + 20, ph + 36);
 
-    // Auto-scale, padded
+    // Auto-scale Cp axis with padding
     let cpMin = -1, cpMax = 1;
     for (const p of pts) {
         if (p.cp < cpMin) cpMin = p.cp;
@@ -1356,19 +1439,45 @@ function drawCpPlot(ctx2d, canvasWidth, canvasHeight) {
     const margin = (cpMax - cpMin) * 0.08;
     cpMin -= margin; cpMax += margin;
 
-    const sx = xc => px0 + xc * pw;
+    // Dynamic x/c range — main chord is always anchored to [0, 1], but the
+    // window extends to fit slat (xc < 0) or flap (xc > 1) data when present.
+    let xcMin = 0, xcMax = 1;
+    for (const p of upper) {
+        if (p.xc < xcMin) xcMin = p.xc;
+        if (p.xc > xcMax) xcMax = p.xc;
+    }
+    for (const p of lower) {
+        if (p.xc < xcMin) xcMin = p.xc;
+        if (p.xc > xcMax) xcMax = p.xc;
+    }
+    xcMin -= 0.02; xcMax += 0.02;
+    const xcSpan = xcMax - xcMin;
+
+    const sx = xc => px0 + (xc - xcMin) / xcSpan * pw;
     // Aero convention: -Cp UP (negative Cp at top).
     const sy = cp => py0 + (cp - cpMin) / (cpMax - cpMin) * ph;
 
-    // Frame + grid
+    // Frame
     ctx2d.strokeStyle = 'rgba(255,255,255,0.25)';
     ctx2d.lineWidth = 1;
     ctx2d.strokeRect(px0 + 0.5, py0 + 0.5, pw - 1, ph - 1);
+
+    // Zero-Cp baseline
     if (cpMin <= 0 && cpMax >= 0) {
         ctx2d.strokeStyle = 'rgba(255,255,255,0.18)';
         ctx2d.beginPath();
         ctx2d.moveTo(px0, sy(0));
         ctx2d.lineTo(px0 + pw, sy(0));
+        ctx2d.stroke();
+    }
+
+    // Main-wing LE (xc=0) and TE (xc=1) reference lines if visible
+    ctx2d.strokeStyle = 'rgba(255,255,255,0.18)';
+    for (const xRef of [0, 1]) {
+        if (xRef < xcMin || xRef > xcMax) continue;
+        ctx2d.beginPath();
+        ctx2d.moveTo(sx(xRef), py0);
+        ctx2d.lineTo(sx(xRef), py0 + ph);
         ctx2d.stroke();
     }
 
@@ -1396,10 +1505,12 @@ function drawCpPlot(ctx2d, canvasWidth, canvasHeight) {
     // Axis labels
     ctx2d.fillStyle = '#bbb';
     ctx2d.font = '9px monospace';
+    // x-axis: show actual range if extended, else LE / TE.
+    const extended = xcMin < -0.05 || xcMax > 1.05;
     ctx2d.textAlign = 'left';
-    ctx2d.fillText('LE',  px0 + 2, py0 + ph + 11);
+    ctx2d.fillText(extended ? 'x/c=' + xcMin.toFixed(2) : 'LE',  px0 + 2, py0 + ph + 11);
     ctx2d.textAlign = 'right';
-    ctx2d.fillText('TE',  px0 + pw - 2, py0 + ph + 11);
+    ctx2d.fillText(extended ? 'x/c=' + xcMax.toFixed(2) : 'TE',  px0 + pw - 2, py0 + ph + 11);
     ctx2d.textAlign = 'left';
     ctx2d.fillText('Cp ' + cpMin.toFixed(1), px0 + 3, py0 + 10);
     ctx2d.fillText('Cp ' + cpMax.toFixed(1), px0 + 3, py0 + ph - 3);
@@ -1419,8 +1530,10 @@ function encodeStateToHash() {
     if (suppressHashWrite) return;
     const qs = new URLSearchParams();
     qs.set('mode', geomMode);
-    if (geomMode === 'naca') qs.set('naca', nacaCode);
-    else {
+    if (geomMode === 'naca') {
+        qs.set('naca', nacaCode);
+        if (highLiftEnabled) qs.set('highlift', '1');
+    } else if (geomMode === 'joukowski') {
         qs.set('thick',  params.thickness.toFixed(2));
         qs.set('camber', params.camber.toFixed(2));
     }
@@ -1451,7 +1564,8 @@ function decodeHashToState() {
         return Math.max(lo, Math.min(hi, v));
     };
     const mode = qs.get('mode');
-    if (mode === 'naca' || mode === 'joukowski') geomMode = mode;
+    if (mode === 'naca' || mode === 'joukowski' || mode === 'cylinder') geomMode = mode;
+    if (qs.get('highlift') === '1') highLiftEnabled = true;
     if (qs.has('naca')) {
         const code = qs.get('naca');
         if (parseNaca(code)) nacaCode = code;
@@ -1463,7 +1577,7 @@ function decodeHashToState() {
     params.viscosity = num('visc',  0.005, 0.08, params.viscosity);
     params.contrast  = num('contrast', 0.5, 3.0, params.contrast);
     const v = qs.get('view');
-    if (v === 'speed' || v === 'vorticity' || v === 'pressure') viewMode = v;
+    if (v === 'speed' || v === 'vorticity' || v === 'pressure' || v === 'noise') viewMode = v;
 }
 
 // Push current state values into every UI element. Used after decoding the
@@ -1485,8 +1599,10 @@ function syncUIFromState() {
     updateGeomDisplay();
     document.getElementById('btn_geom_naca').classList.toggle('active', geomMode === 'naca');
     document.getElementById('btn_geom_jouk').classList.toggle('active', geomMode === 'joukowski');
+    document.getElementById('btn_geom_cyl').classList.toggle('active', geomMode === 'cylinder');
     document.getElementById('ctrl_naca').style.display = geomMode === 'naca' ? '' : 'none';
     document.getElementById('ctrl_jouk').style.display = geomMode === 'joukowski' ? '' : 'none';
+    document.getElementById('btn_highlift').classList.toggle('active', highLiftEnabled);
     const bv = document.getElementById('btn_view');
     bv.innerText = viewMode.charAt(0).toUpperCase() + viewMode.slice(1);
     bv.classList.toggle('active', viewMode !== 'speed');
@@ -1541,6 +1657,38 @@ function draw() {
             px[i*4+2] = tmp[2];
             px[i*4+3] = 255;
         }
+    } else if (viewMode === 'noise') {
+        // Lighthill acoustic source (low-Mach):
+        //   S = ρ · trace((∇u)²) = ρ · [ (∂u/∂x)² + 2(∂u/∂y)(∂v/∂x) + (∂v/∂y)² ]
+        // It's where vortex-induced sound comes from. Diverging colormap with a
+        // log-style mapping so we see a wide dynamic range.
+        const u0 = Math.max(params.speed, 0.01);
+        const sScale = 0.02 * u0 * u0 / params.contrast;
+        const tmp = [0, 0, 0];
+        for (let y = 0; y < H; y++) {
+            for (let x = 0; x < W; x++) {
+                const i = x + y * W;
+                if (barrier[i]) {
+                    px[i*4] = 40; px[i*4+1] = 40; px[i*4+2] = 40; px[i*4+3] = 255;
+                    continue;
+                }
+                let s = 0;
+                if (x > 0 && x < W - 1 && y > 0 && y < H - 1) {
+                    const dudx = 0.5 * (ux[(x+1) + y*W] - ux[(x-1) + y*W]);
+                    const dudy = 0.5 * (ux[x + (y+1)*W] - ux[x + (y-1)*W]);
+                    const dvdx = 0.5 * (uy[(x+1) + y*W] - uy[(x-1) + y*W]);
+                    const dvdy = 0.5 * (uy[x + (y+1)*W] - uy[x + (y-1)*W]);
+                    s = rho[i] * (dudx*dudx + 2*dudy*dvdx + dvdy*dvdy);
+                }
+                // Soft compression for wide dynamic range, preserving sign.
+                const t = Math.sign(s) * Math.log1p(Math.abs(s) / sScale) / 2.5;
+                divergingColor(t, tmp);
+                px[i*4]   = tmp[0];
+                px[i*4+1] = tmp[1];
+                px[i*4+2] = tmp[2];
+                px[i*4+3] = 255;
+            }
+        }
     } else {
         for (let i = 0; i < N; i++) {
             if (barrier[i]) {
@@ -1567,29 +1715,25 @@ function draw() {
     // Draw fluid scaled
     ctx.drawImage(offCanvas, 0, 0, simWidth, simHeight, 0, 0, width, height);
 
-    // 3. Draw Vector Airfoil Overlay
+    // 3. Draw Vector Airfoil Overlay (main + any extra elements)
     if(airfoilPolygon.length > 0) {
         const scaleX = width / simWidth;
         const scaleY = height / simHeight;
-
-        ctx.beginPath();
-        // Move to first point
-        ctx.moveTo(airfoilPolygon[0].x * scaleX, airfoilPolygon[0].y * scaleY);
-        for(let i=1; i<airfoilPolygon.length; i++) {
-            ctx.lineTo(airfoilPolygon[i].x * scaleX, airfoilPolygon[i].y * scaleY);
+        function strokePolygon(poly) {
+            ctx.beginPath();
+            ctx.moveTo(poly[0].x * scaleX, poly[0].y * scaleY);
+            for (let i = 1; i < poly.length; i++) {
+                ctx.lineTo(poly[i].x * scaleX, poly[i].y * scaleY);
+            }
+            ctx.closePath();
+            ctx.fillStyle = "#e0e0e0";
+            ctx.fill();
+            ctx.strokeStyle = "#000";
+            ctx.lineWidth = 2;
+            ctx.stroke();
         }
-        ctx.closePath();
-        
-        // Style
-        ctx.fillStyle = "#e0e0e0"; // Light Grey
-        ctx.fill();
-        ctx.strokeStyle = "#000";
-        ctx.lineWidth = 2;
-        ctx.stroke();
-
-        // Add specific "leading edge" highlight or fancy effect
-        ctx.shadowBlur = 10;
-        ctx.shadowColor = "rgba(0,0,0,0.5)";
+        strokePolygon(airfoilPolygon);
+        for (const p of extraPolygons) strokePolygon(p);
         ctx.shadowBlur = 0;
     }
 
@@ -1877,10 +2021,11 @@ document.getElementById('btn_pause').addEventListener('click', function() {
 });
 
 document.getElementById('btn_view').addEventListener('click', function() {
-    // Cycle speed -> vorticity -> pressure -> speed. Button label shows the
-    // CURRENT mode so it stays in lockstep with the legend.
+    // Cycle speed -> vorticity -> pressure -> noise -> speed. Button label
+    // shows the CURRENT mode so it stays in lockstep with the legend.
     if (viewMode === 'speed') viewMode = 'vorticity';
     else if (viewMode === 'vorticity') viewMode = 'pressure';
+    else if (viewMode === 'pressure') viewMode = 'noise';
     else viewMode = 'speed';
     this.innerText = viewMode.charAt(0).toUpperCase() + viewMode.slice(1);
     this.classList.toggle('active', viewMode !== 'speed');
@@ -1903,14 +2048,18 @@ document.getElementById('btn_optimize').addEventListener('click', function() {
 });
 
 function updateGeomDisplay() {
-    document.getElementById('disp_geom').innerText =
-        geomMode === 'naca' ? ('NACA ' + nacaCode) : 'Joukowski';
+    let label;
+    if (geomMode === 'cylinder') label = 'Cylinder';
+    else if (geomMode === 'joukowski') label = 'Joukowski';
+    else label = 'NACA ' + nacaCode + (highLiftEnabled ? ' + slat/flap' : '');
+    document.getElementById('disp_geom').innerText = label;
 }
 
 function setGeomMode(mode) {
     geomMode = mode;
     document.getElementById('btn_geom_naca').classList.toggle('active', mode === 'naca');
     document.getElementById('btn_geom_jouk').classList.toggle('active', mode === 'joukowski');
+    document.getElementById('btn_geom_cyl').classList.toggle('active', mode === 'cylinder');
     document.getElementById('ctrl_naca').style.display = mode === 'naca' ? '' : 'none';
     document.getElementById('ctrl_jouk').style.display = mode === 'joukowski' ? '' : 'none';
     updateGeomDisplay();
@@ -1919,6 +2068,14 @@ function setGeomMode(mode) {
 
 document.getElementById('btn_geom_naca').addEventListener('click', () => setGeomMode('naca'));
 document.getElementById('btn_geom_jouk').addEventListener('click', () => setGeomMode('joukowski'));
+document.getElementById('btn_geom_cyl').addEventListener('click', () => setGeomMode('cylinder'));
+
+document.getElementById('btn_highlift').addEventListener('click', function() {
+    highLiftEnabled = !highLiftEnabled;
+    this.classList.toggle('active', highLiftEnabled);
+    updateGeomDisplay();
+    buildGeometry();
+});
 
 document.getElementById('in_naca').addEventListener('input', (e) => {
     const v = e.target.value.replace(/\D/g, '').substring(0, 4);
