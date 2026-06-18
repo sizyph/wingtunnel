@@ -190,6 +190,15 @@
             border-top: 1px solid rgba(255, 255, 255, 0.1);
         }
 
+        #sparkline {
+            display: block;
+            width: 100%;
+            height: 58px;
+            margin-top: 8px;
+            background: rgba(0, 0, 0, 0.25);
+            border-radius: 4px;
+        }
+
         input[type=text] {
             width: 100%;
             padding: 6px 10px;
@@ -314,6 +323,7 @@
             Cl: +0.000   Cd: +0.000<br>
             L/D: 0.0   Re: 0
         </div>
+        <canvas id="sparkline" width="280" height="58"></canvas>
 
         <div class="hint">
             Drag the wing to rotate it.<br>
@@ -402,6 +412,22 @@ const optimizer = {
     best: null,         // { code, aoa, cl, cd }
     trial: null
 };
+
+// Cl/Cd history for the panel sparkline (ring buffer)
+const HIST_LEN = 240;
+const clHist = new Float32Array(HIST_LEN);
+const cdHist = new Float32Array(HIST_LEN);
+let histIdx = 0;
+let histCount = 0;
+
+// Cp distribution cache — recomputed every few frames since walking the
+// airfoil bbox is non-trivial.
+let cpCache = null;
+let cpCacheTick = -100;
+
+// URL-hash state sync (writes are throttled to avoid hammering history.replaceState)
+let lastHashWrite = 0;
+let suppressHashWrite = true; // becomes false after initial state is applied
 
 // Parameters
 const params = {
@@ -1178,6 +1204,294 @@ function drawColorLegend(ctx2d, canvasWidth, canvasHeight) {
     ctx2d.textAlign = 'left';
 }
 
+// ============================================================================
+// Cl/Cd sparkline — drawn in its own panel canvas each frame.
+// ============================================================================
+const sparkCanvas = document.getElementById('sparkline');
+const sparkCtx = sparkCanvas ? sparkCanvas.getContext('2d') : null;
+
+function pushHistory() {
+    clHist[histIdx] = Cl;
+    cdHist[histIdx] = Cd;
+    histIdx = (histIdx + 1) % HIST_LEN;
+    if (histCount < HIST_LEN) histCount++;
+}
+
+function drawSparkline() {
+    if (!sparkCtx) return;
+    // Match backing-store size to layout, so the plot doesn't blur.
+    const rect = sparkCanvas.getBoundingClientRect();
+    const wantW = Math.max(1, Math.floor(rect.width));
+    const wantH = Math.max(1, Math.floor(rect.height));
+    if (sparkCanvas.width !== wantW)  sparkCanvas.width  = wantW;
+    if (sparkCanvas.height !== wantH) sparkCanvas.height = wantH;
+    const W = sparkCanvas.width, H = sparkCanvas.height;
+    sparkCtx.clearRect(0, 0, W, H);
+    if (histCount < 2) return;
+
+    // Find Cl bounds and the magnified Cd bounds together so they share a Y axis.
+    const cdGain = 10;
+    let lo = 0, hi = 0;
+    for (let k = 0; k < histCount; k++) {
+        const i = (histIdx - histCount + k + HIST_LEN) % HIST_LEN;
+        const cl = clHist[i];
+        const cdg = cdHist[i] * cdGain;
+        if (cl < lo) lo = cl; else if (cl > hi) hi = cl;
+        if (cdg < lo) lo = cdg; else if (cdg > hi) hi = cdg;
+    }
+    const span = Math.max(hi - lo, 0.4);
+    const pad = span * 0.15;
+    lo -= pad; hi += pad;
+    const top = 12, bot = H - 4;
+    const yOf = v => bot - (v - lo) / (hi - lo) * (bot - top);
+
+    // Zero baseline
+    sparkCtx.strokeStyle = 'rgba(255,255,255,0.12)';
+    sparkCtx.lineWidth = 1;
+    if (lo <= 0 && hi >= 0) {
+        sparkCtx.beginPath();
+        sparkCtx.moveTo(0, yOf(0));
+        sparkCtx.lineTo(W, yOf(0));
+        sparkCtx.stroke();
+    }
+
+    function drawSeries(buf, gain, color) {
+        sparkCtx.strokeStyle = color;
+        sparkCtx.lineWidth = 1.4;
+        sparkCtx.beginPath();
+        for (let k = 0; k < histCount; k++) {
+            const i = (histIdx - histCount + k + HIST_LEN) % HIST_LEN;
+            const x = (k / (histCount - 1)) * W;
+            const y = yOf(buf[i] * gain);
+            if (k === 0) sparkCtx.moveTo(x, y);
+            else sparkCtx.lineTo(x, y);
+        }
+        sparkCtx.stroke();
+    }
+    drawSeries(clHist, 1,       '#4ade80');
+    drawSeries(cdHist, cdGain,  '#ef4444');
+
+    // Tiny inline legend
+    sparkCtx.font = '9px monospace';
+    sparkCtx.textAlign = 'left';
+    sparkCtx.fillStyle = '#4ade80'; sparkCtx.fillText('Cl',         4, 10);
+    sparkCtx.fillStyle = '#ef4444'; sparkCtx.fillText('Cd×10', 22, 10);
+}
+
+// ============================================================================
+// Cp(x/c) surface plot — samples ρ at every airfoil cell adjacent to a fluid
+// cell, projects onto the chord, separates upper/lower, plots in a corner.
+// ============================================================================
+function computeCpDistribution() {
+    const pts = [];
+    if (airfoilChord < 5 || airfoilPolygon.length < 3) return pts;
+    const lex = airfoilLE.x, ley = airfoilLE.y;
+    const tex = airfoilTE.x, tey = airfoilTE.y;
+    const chordVx = tex - lex, chordVy = tey - ley;
+    const chord2 = chordVx*chordVx + chordVy*chordVy;
+    if (chord2 < 1) return pts;
+    const u_inf = Math.max(params.speed, 0.01);
+    const q_inf = 0.5 * u_inf * u_inf;
+    const p_inf = 1.0 / 3.0;
+    // Walk only the polygon's bounding box.
+    let minX=simWidth, maxX=0, minY=simHeight, maxY=0;
+    for (const p of airfoilPolygon) {
+        if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
+        if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y;
+    }
+    minX = Math.max(1, Math.floor(minX) - 1);
+    maxX = Math.min(simWidth - 2, Math.ceil(maxX) + 1);
+    minY = Math.max(1, Math.floor(minY) - 1);
+    maxY = Math.min(simHeight - 2, Math.ceil(maxY) + 1);
+    for (let y = minY; y <= maxY; y++) {
+        for (let x = minX; x <= maxX; x++) {
+            const i = x + y * simWidth;
+            if (barrier[i] !== 2) continue;
+            let sumRho = 0, count = 0;
+            // Only cardinal neighbours — they're the cleanest pressure samples.
+            const neigh = [i-1, i+1, i-simWidth, i+simWidth];
+            for (let n = 0; n < 4; n++) {
+                if (barrier[neigh[n]] === 0) { sumRho += rho[neigh[n]]; count++; }
+            }
+            if (count === 0) continue;
+            const cp = (sumRho / count / 3.0 - p_inf) / q_inf;
+            const dx = x - lex, dy = y - ley;
+            const xc = (dx*chordVx + dy*chordVy) / chord2;
+            const cross = chordVx * dy - chordVy * dx; // y is screen-down here
+            pts.push({ xc, cp, upper: cross < 0 });
+        }
+    }
+    return pts;
+}
+
+function drawCpPlot(ctx2d, canvasWidth, canvasHeight) {
+    if (airfoilChord < 5) return;
+    const tick = stepCount;
+    if (!cpCache || tick - cpCacheTick > 6) {
+        cpCache = computeCpDistribution();
+        cpCacheTick = tick;
+    }
+    const pts = cpCache;
+    if (pts.length < 4) return;
+
+    const upper = pts.filter(p => p.upper && p.xc >= -0.05 && p.xc <= 1.05).sort((a,b) => a.xc - b.xc);
+    const lower = pts.filter(p => !p.upper && p.xc >= -0.05 && p.xc <= 1.05).sort((a,b) => a.xc - b.xc);
+    if (upper.length + lower.length < 4) return;
+
+    const pw = 240, ph = 130;
+    // Top-left — keeps clear of the right-side UI panel and the bottom legend.
+    const px0 = 20;
+    const py0 = 32;
+
+    // Background plate
+    ctx2d.fillStyle = 'rgba(0, 0, 0, 0.55)';
+    ctx2d.fillRect(px0 - 10, py0 - 22, pw + 20, ph + 36);
+
+    // Auto-scale, padded
+    let cpMin = -1, cpMax = 1;
+    for (const p of pts) {
+        if (p.cp < cpMin) cpMin = p.cp;
+        if (p.cp > cpMax) cpMax = p.cp;
+    }
+    const margin = (cpMax - cpMin) * 0.08;
+    cpMin -= margin; cpMax += margin;
+
+    const sx = xc => px0 + xc * pw;
+    // Aero convention: -Cp UP (negative Cp at top).
+    const sy = cp => py0 + (cp - cpMin) / (cpMax - cpMin) * ph;
+
+    // Frame + grid
+    ctx2d.strokeStyle = 'rgba(255,255,255,0.25)';
+    ctx2d.lineWidth = 1;
+    ctx2d.strokeRect(px0 + 0.5, py0 + 0.5, pw - 1, ph - 1);
+    if (cpMin <= 0 && cpMax >= 0) {
+        ctx2d.strokeStyle = 'rgba(255,255,255,0.18)';
+        ctx2d.beginPath();
+        ctx2d.moveTo(px0, sy(0));
+        ctx2d.lineTo(px0 + pw, sy(0));
+        ctx2d.stroke();
+    }
+
+    // Title
+    ctx2d.fillStyle = '#eaeaea';
+    ctx2d.font = '11px sans-serif';
+    ctx2d.textAlign = 'left';
+    ctx2d.fillText('Cp(x/c)   suction ↑', px0, py0 - 7);
+
+    function plotLine(arr, color) {
+        if (arr.length < 2) return;
+        ctx2d.strokeStyle = color;
+        ctx2d.lineWidth = 1.6;
+        ctx2d.beginPath();
+        for (let i = 0; i < arr.length; i++) {
+            const X = sx(arr[i].xc), Y = sy(arr[i].cp);
+            if (i === 0) ctx2d.moveTo(X, Y);
+            else ctx2d.lineTo(X, Y);
+        }
+        ctx2d.stroke();
+    }
+    plotLine(upper, '#60a5fa'); // upper surface
+    plotLine(lower, '#fbbf24'); // lower surface
+
+    // Axis labels
+    ctx2d.fillStyle = '#bbb';
+    ctx2d.font = '9px monospace';
+    ctx2d.textAlign = 'left';
+    ctx2d.fillText('LE',  px0 + 2, py0 + ph + 11);
+    ctx2d.textAlign = 'right';
+    ctx2d.fillText('TE',  px0 + pw - 2, py0 + ph + 11);
+    ctx2d.textAlign = 'left';
+    ctx2d.fillText('Cp ' + cpMin.toFixed(1), px0 + 3, py0 + 10);
+    ctx2d.fillText('Cp ' + cpMax.toFixed(1), px0 + 3, py0 + ph - 3);
+
+    // Series legend
+    ctx2d.textAlign = 'right';
+    ctx2d.fillStyle = '#60a5fa'; ctx2d.fillText('▬ upper', px0 + pw - 4, py0 + 10);
+    ctx2d.fillStyle = '#fbbf24'; ctx2d.fillText('▬ lower', px0 + pw - 4, py0 + 22);
+    ctx2d.textAlign = 'left';
+}
+
+// ============================================================================
+// URL hash state — encode current scene into #naca=...&aoa=... so users can
+// share a configuration with a link.
+// ============================================================================
+function encodeStateToHash() {
+    if (suppressHashWrite) return;
+    const qs = new URLSearchParams();
+    qs.set('mode', geomMode);
+    if (geomMode === 'naca') qs.set('naca', nacaCode);
+    else {
+        qs.set('thick',  params.thickness.toFixed(2));
+        qs.set('camber', params.camber.toFixed(2));
+    }
+    qs.set('aoa',      String(params.aoa));
+    qs.set('speed',    params.speed.toFixed(2));
+    qs.set('visc',     params.viscosity.toFixed(3));
+    qs.set('contrast', params.contrast.toFixed(1));
+    qs.set('view',     viewMode);
+    try {
+        history.replaceState(null, '', '#' + qs.toString());
+    } catch (e) { /* SecurityError in some sandboxed embeds — silently skip */ }
+}
+
+function maybeUpdateHash(now) {
+    if (suppressHashWrite) return;
+    if (now - lastHashWrite < 600) return;
+    lastHashWrite = now;
+    encodeStateToHash();
+}
+
+function decodeHashToState() {
+    if (!location.hash || location.hash.length <= 1) return;
+    const qs = new URLSearchParams(location.hash.slice(1));
+    const num = (k, lo, hi, fallback) => {
+        if (!qs.has(k)) return fallback;
+        const v = parseFloat(qs.get(k));
+        if (!isFinite(v)) return fallback;
+        return Math.max(lo, Math.min(hi, v));
+    };
+    const mode = qs.get('mode');
+    if (mode === 'naca' || mode === 'joukowski') geomMode = mode;
+    if (qs.has('naca')) {
+        const code = qs.get('naca');
+        if (parseNaca(code)) nacaCode = code;
+    }
+    params.thickness = num('thick',  0.02, 0.25, params.thickness);
+    params.camber    = num('camber', -0.2, 0.2,  params.camber);
+    params.aoa       = Math.round(num('aoa', -45, 45, params.aoa));
+    params.speed     = num('speed', 0, 0.3, params.speed);
+    params.viscosity = num('visc',  0.005, 0.08, params.viscosity);
+    params.contrast  = num('contrast', 0.5, 3.0, params.contrast);
+    const v = qs.get('view');
+    if (v === 'speed' || v === 'vorticity' || v === 'pressure') viewMode = v;
+}
+
+// Push current state values into every UI element. Used after decoding the
+// URL hash on startup so the panel reflects what the URL asked for.
+function syncUIFromState() {
+    document.getElementById('in_aoa').value      = params.aoa;
+    document.getElementById('disp_aoa').innerText = params.aoa + '°';
+    document.getElementById('in_speed').value    = params.speed;
+    document.getElementById('disp_speed').innerText = params.speed.toFixed(2);
+    document.getElementById('in_visc').value     = params.viscosity;
+    document.getElementById('disp_visc').innerText = params.viscosity.toFixed(3);
+    document.getElementById('in_cont').value     = params.contrast;
+    document.getElementById('disp_cont').innerText = params.contrast.toFixed(1);
+    document.getElementById('in_thick').value    = params.thickness;
+    document.getElementById('disp_thick').innerText = params.thickness.toFixed(2);
+    document.getElementById('in_camber').value   = params.camber;
+    document.getElementById('disp_camber').innerText = params.camber.toFixed(2);
+    document.getElementById('in_naca').value     = nacaCode;
+    updateGeomDisplay();
+    document.getElementById('btn_geom_naca').classList.toggle('active', geomMode === 'naca');
+    document.getElementById('btn_geom_jouk').classList.toggle('active', geomMode === 'joukowski');
+    document.getElementById('ctrl_naca').style.display = geomMode === 'naca' ? '' : 'none';
+    document.getElementById('ctrl_jouk').style.display = geomMode === 'joukowski' ? '' : 'none';
+    const bv = document.getElementById('btn_view');
+    bv.innerText = viewMode.charAt(0).toUpperCase() + viewMode.slice(1);
+    bv.classList.toggle('active', viewMode !== 'speed');
+}
+
 function draw() {
     // 1. Render Fluid to Offscreen Buffer
     const W = simWidth;
@@ -1337,7 +1651,11 @@ function draw() {
         ctx.fillText('D  Cd=' + Cd.toFixed(3), dragX + 4, qy + 14);
     }
 
-    // 6. Color legend — drawn last so it sits on top of everything.
+    // 6. Cp(x/c) surface plot — tied to the Forces toggle since they're both
+    //    aero diagnostics.
+    if (forcesEnabled) drawCpPlot(ctx, width, height);
+
+    // 7. Color legend — drawn last so it sits on top of everything.
     drawColorLegend(ctx, width, height);
 }
 
@@ -1360,8 +1678,11 @@ function loop() {
         }
         if (particlesEnabled) advectParticles();
         tickOptimizer();
+        pushHistory();
     }
     draw();
+    drawSparkline();
+    maybeUpdateHash(performance.now());
 
     const LD = Math.abs(Cd) > 1e-3 ? (Cl / Cd) : 0;
     const Re = params.viscosity > 1e-6
@@ -1518,9 +1839,12 @@ document.addEventListener('keydown', (e) => {
 });
 
 // Initialization
+decodeHashToState();
+syncUIFromState();
 buildGeometry();
 initFluid();
 initParticles();
+suppressHashWrite = false; // allow hash writes from now on
 
 // Listeners
 const inputs = document.querySelectorAll('input[type=range]');
