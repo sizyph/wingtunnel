@@ -323,6 +323,7 @@
             <button id="btn_pause">Pause</button>
         </div>
         <div class="btn-row" style="margin-top: 6px;">
+            <button id="btn_freeflight">Free Flight</button>
             <button id="btn_optimize">Optimize ↑ Cl</button>
         </div>
 
@@ -337,7 +338,7 @@
         <div class="hint">
             Drag the wing to rotate · drag the flap to deflect it.<br>
             <kbd>space</kbd> pause · <kbd>v</kbd> view · <kbd>p</kbd> particles<br>
-            <kbd>f</kbd> forces · <kbd>o</kbd> optimize · <kbd>r</kbd> reset
+            <kbd>f</kbd> forces · <kbd>o</kbd> optimize · <kbd>g</kbd> free flight · <kbd>r</kbd> reset
         </div>
     </div>
 
@@ -384,7 +385,16 @@ let airfoilPolygon = []; // Stores vector points for drawing
 let airfoilChord = 1;    // grid units, max extent of polygon
 let viewMode = 'speed';  // 'speed' or 'vorticity'
 let Fx_accum = 0, Fy_accum = 0;
+let Mz_accum = 0;        // pitching moment about wing pivot (lattice units)
 let Cl = 0, Cd = 0;      // smoothed lift / drag coefficients
+
+// Free-flight FSI: wing pitches under aerodynamic moment with damping.
+let freeFlightEnabled = false;
+let aoaContinuous = 15;  // float AoA used during free flight
+let aoaRate = 0;         // degrees per LBM step
+let Mz_smoothed = 0;
+const I_FLIGHT = 2.0e6;  // rotational inertia
+const GAMMA_FLIGHT = 0.003; // viscous damping per LBM step
 let geomMode = 'naca';   // 'naca' | 'joukowski' | 'cylinder'
 let nacaCode = '2412';
 let flapEnabled = false;         // adds a rear flap to the main NACA element
@@ -980,6 +990,42 @@ function tickOptimizer() {
     }
 }
 
+// FSI integrator: pitch the wing under the aerodynamic moment about its
+// pivot. I·α̈ = M − γ·α̇, integrated explicit-Euler at one LBM step per call
+// (called once per animation frame, after 8 substeps of solve()).
+// Dragging or the optimizer being active pauses the integration so user
+// input always wins.
+function tickFreeFlight() {
+    if (!freeFlightEnabled) return;
+    if (optimizer.active) return;
+    if (dragging || draggingFlap) {
+        // User is steering — let them, and clear the angular rate so the
+        // wing doesn't keep coasting in the wrong direction after release.
+        aoaContinuous = params.aoa;
+        aoaRate = 0;
+        return;
+    }
+    if (geomMode === 'cylinder') return; // AoA meaningless for a circle
+    // Smooth the moment a bit — raw Mz oscillates with vortex shedding.
+    Mz_smoothed = 0.92 * Mz_smoothed + 0.08 * Mz_accum;
+    const accelDeg = (Mz_smoothed / I_FLIGHT) * 180 / Math.PI; // deg per step²
+    const dt = 8; // we ran 8 LBM substeps before this tick
+    aoaRate += accelDeg * dt;
+    aoaRate -= GAMMA_FLIGHT * aoaRate * dt;
+    aoaContinuous += aoaRate * dt;
+    if (aoaContinuous >  45) { aoaContinuous =  45; aoaRate = 0; }
+    if (aoaContinuous < -45) { aoaContinuous = -45; aoaRate = 0; }
+    const next = Math.round(aoaContinuous);
+    if (next !== params.aoa) {
+        params.aoa = next;
+        const slider = document.getElementById('in_aoa');
+        if (slider) slider.value = next;
+        const disp = document.getElementById('disp_aoa');
+        if (disp) disp.innerText = next + '°';
+        buildGeometry();
+    }
+}
+
 function getEquilibrium(rho, u, v, i) {
     const cu = 3.0 * (ex[i] * u + ey[i] * v);
     const u2 = 1.5 * (u * u + v * v);
@@ -1079,7 +1125,8 @@ function solve() {
 
     // 4. Streaming & Boundary Conditions. We also integrate momentum exchange
     // on airfoil bounce-back to get instantaneous lift / drag.
-    let fx = 0, fy = 0;
+    let fx = 0, fy = 0, mz = 0;
+    const pivotX = simWidth * 0.25, pivotY = simHeight * 0.5;
     for (let y = 0; y < simHeight; y++) {
         for (let x = 0; x < simWidth; x++) {
             const i = x + y * simWidth;
@@ -1120,8 +1167,15 @@ function solve() {
                         }
                         f1[i*9 + opposite[k]] = f_back;
                         // Momentum exchange: F_link = (f_pre + f_post) * e_k
-                        fx += (f_k + f_back) * ex[k];
-                        fy += (f_k + f_back) * ey[k];
+                        const fxL = (f_k + f_back) * ex[k];
+                        const fyL = (f_k + f_back) * ey[k];
+                        fx += fxL;
+                        fy += fyL;
+                        // Pitching moment about the wing's pivot. Force applied
+                        // at the lattice link midpoint between fluid and wall.
+                        const rx = (x + 0.5*ex[k]) - pivotX;
+                        const ry = (y + 0.5*ey[k]) - pivotY;
+                        mz += rx * fyL - ry * fxL;
                     } else {
                         // Channel wall — half-way BB, no force tally
                         f1[i*9 + opposite[k]] = f0[i*9 + k];
@@ -1133,6 +1187,7 @@ function solve() {
     }
     Fx_accum = fx;
     Fy_accum = fy;
+    Mz_accum = mz;
 
     // Outlet Correction (West side handled by Macro override, East side extrapolation)
     for(let y=1; y<simHeight-1; y++) {
@@ -1547,6 +1602,7 @@ function encodeStateToHash() {
     qs.set('visc',     params.viscosity.toFixed(3));
     qs.set('contrast', params.contrast.toFixed(1));
     qs.set('view',     viewMode);
+    if (freeFlightEnabled) qs.set('free', '1');
     try {
         history.replaceState(null, '', '#' + qs.toString());
     } catch (e) { /* SecurityError in some sandboxed embeds — silently skip */ }
@@ -1588,6 +1644,7 @@ function decodeHashToState() {
     params.contrast  = num('contrast', 0.5, 3.0, params.contrast);
     const v = qs.get('view');
     if (v === 'speed' || v === 'vorticity' || v === 'pressure' || v === 'noise') viewMode = v;
+    if (qs.get('free') === '1') freeFlightEnabled = true;
 }
 
 // Push current state values into every UI element. Used after decoding the
@@ -1616,6 +1673,9 @@ function syncUIFromState() {
     document.getElementById('ctrl_flap').style.display = flapEnabled ? '' : 'none';
     document.getElementById('in_flapdef').value = flapDeflectionDeg;
     document.getElementById('disp_flapdef').innerText = flapDeflectionDeg + '°';
+    document.getElementById('btn_freeflight').classList.toggle('active', freeFlightEnabled);
+    document.getElementById('in_aoa').disabled = freeFlightEnabled;
+    if (freeFlightEnabled) { aoaContinuous = params.aoa; aoaRate = 0; }
     const bv = document.getElementById('btn_view');
     bv.innerText = viewMode.charAt(0).toUpperCase() + viewMode.slice(1);
     bv.classList.toggle('active', viewMode !== 'speed');
@@ -1837,6 +1897,7 @@ function loop() {
         }
         if (particlesEnabled) advectParticles();
         tickOptimizer();
+        tickFreeFlight();
         pushHistory();
     }
     draw();
@@ -2055,6 +2116,7 @@ document.addEventListener('keydown', (e) => {
         'p':       'btn_particles',
         'f':       'btn_forces',
         'o':       'btn_optimize',
+        'g':       'btn_freeflight',
         'r':       'btn_reset'
     };
     const id = map[k];
@@ -2090,6 +2152,9 @@ document.getElementById('btn_reset').addEventListener('click', () => {
     buildGeometry();
     initParticles();
     Cl = 0; Cd = 0;
+    Mz_smoothed = 0;
+    aoaRate = 0;
+    aoaContinuous = params.aoa;
     unstable = false;
     paused = false;
     const bp = document.getElementById('btn_pause');
@@ -2128,6 +2193,19 @@ document.getElementById('btn_forces').addEventListener('click', function() {
 document.getElementById('btn_optimize').addEventListener('click', function() {
     if (optimizer.active) stopOptimize();
     else startOptimize();
+});
+
+document.getElementById('btn_freeflight').addEventListener('click', function() {
+    freeFlightEnabled = !freeFlightEnabled;
+    this.classList.toggle('active', freeFlightEnabled);
+    // Lock the AoA slider while the wing is flying itself.
+    const aoaSlider = document.getElementById('in_aoa');
+    if (aoaSlider) aoaSlider.disabled = freeFlightEnabled;
+    if (freeFlightEnabled) {
+        aoaContinuous = params.aoa;
+        aoaRate = 0;
+        Mz_smoothed = 0;
+    }
 });
 
 function updateGeomDisplay() {
