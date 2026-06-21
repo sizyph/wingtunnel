@@ -333,6 +333,9 @@
             <button id="btn_polar">Run Polar</button>
             <button id="btn_audio">Karman tone</button>
         </div>
+        <div class="btn-row" style="margin-top: 6px;">
+            <button id="btn_mrt">MRT solver</button>
+        </div>
 
         <div class="stats" id="simStatus">
             Steps: 0<br>
@@ -346,7 +349,7 @@
             Drag the wing to rotate · drag the flap to deflect it.<br>
             <kbd>space</kbd> pause · <kbd>v</kbd> view · <kbd>p</kbd> particles<br>
             <kbd>f</kbd> forces · <kbd>o</kbd> optimize · <kbd>g</kbd> free flight<br>
-            <kbd>t</kbd> heated wing · <kbd>r</kbd> reset
+            <kbd>t</kbd> heated wing · <kbd>m</kbd> MRT · <kbd>r</kbd> reset
         </div>
     </div>
 
@@ -421,6 +424,14 @@ const polar = {
 // Strouhal-tone audio: pitch-shift the dominant Cl frequency into the
 // audible range. WebAudio needs a user gesture to start, hence the toggle.
 let audioCtx = null, audioOsc = null, audioGain = null, audioEnabled = false;
+
+// MRT (Lallemand-Luo D2Q9) — replaces BGK in the collision step. Stress
+// modes (pxx, pxy) relax at the local Smagorinsky ω; bulk modes relax at
+// fixed independent rates so the solver stays stable at much lower ν.
+let mrtEnabled = false;
+const S_E   = 1.4; // energy relaxation
+const S_EPS = 1.4; // energy² relaxation
+const S_Q   = 1.7; // energy-flux relaxation
 
 // Boussinesq thermal coupling
 let thermalEnabled = false;
@@ -1421,18 +1432,83 @@ function solve() {
             const tau_add = 0.5 * (Math.sqrt(tau_0*tau_0 + 18.0 * C*C * Pi / r) - tau_0);
             const omega = 1.0 / (tau_0 + tau_add);
 
-            // 3. Collision (BGK) + Guo forcing term for buoyancy
+            // 3. Collision: MRT or BGK, with Guo body-force term for buoyancy
             const guoCoef = 1.0 - 0.5 * omega;
             const uDotF = u_real * Fx_body + v_real * Fy_body;
-            for (let k = 0; k < 9; k++) {
-                const feq = getEquilibrium(r, u_real, v_real, k);
-                let fpost = f0[offset+k] * (1.0 - omega) + feq * omega;
+            if (mrtEnabled) {
+                // Lallemand-Luo MRT: project f into 9 moments, relax each at
+                // its own rate, project back via M⁻¹.
+                const f_0 = f0[offset+0], f_1 = f0[offset+1], f_2 = f0[offset+2];
+                const f_3 = f0[offset+3], f_4 = f0[offset+4], f_5 = f0[offset+5];
+                const f_6 = f0[offset+6], f_7 = f0[offset+7], f_8 = f0[offset+8];
+                // Forward transform m = M·f
+                const m_e   = -4*f_0 -   f_1 -   f_2 -   f_3 -   f_4 + 2*f_5 + 2*f_6 + 2*f_7 + 2*f_8;
+                const m_eps =  4*f_0 - 2*f_1 - 2*f_2 - 2*f_3 - 2*f_4 +   f_5 +   f_6 +   f_7 +   f_8;
+                const jx    = f_1 - f_3 + f_5 - f_6 - f_7 + f_8;            // conserved
+                const m_qx  = -2*f_1 + 2*f_3 + f_5 - f_6 - f_7 + f_8;
+                const jy    = f_2 - f_4 + f_5 + f_6 - f_7 - f_8;            // conserved
+                const m_qy  = -2*f_2 + 2*f_4 + f_5 + f_6 - f_7 - f_8;
+                const m_pxx = f_1 - f_2 + f_3 - f_4;
+                const m_pxy = f_5 - f_6 + f_7 - f_8;
+                // Equilibrium moments (use Guo-corrected velocity)
+                const usq  = u_real * u_real + v_real * v_real;
+                const me_eq   = r * (-2 + 3 * usq);
+                const meps_eq = r * (1 - 3 * usq);
+                const mqx_eq  = -r * u_real;
+                const mqy_eq  = -r * v_real;
+                const mpxx_eq = r * (u_real*u_real - v_real*v_real);
+                const mpxy_eq = r * u_real * v_real;
+                // Relax non-conserved moments
+                const me_p   = m_e   + S_E   * (me_eq   - m_e);
+                const meps_p = m_eps + S_EPS * (meps_eq - m_eps);
+                const mqx_p  = m_qx  + S_Q   * (mqx_eq  - m_qx);
+                const mqy_p  = m_qy  + S_Q   * (mqy_eq  - m_qy);
+                const mpxx_p = m_pxx + omega * (mpxx_eq - m_pxx);
+                const mpxy_p = m_pxy + omega * (mpxy_eq - m_pxy);
+                // Inverse transform: f = M⁻¹·m'
+                const r_9  = r        / 9.0;
+                const me_9 = me_p     / 9.0;
+                const me_18 = me_p    / 18.0;
+                const me_36 = me_p    / 36.0;
+                const meps_9 = meps_p / 9.0;
+                const meps_18 = meps_p / 18.0;
+                const meps_36 = meps_p / 36.0;
+                const jx_6  = jx     / 6.0;
+                const jy_6  = jy     / 6.0;
+                const mqx_6  = mqx_p / 6.0;
+                const mqx_12 = mqx_p / 12.0;
+                const mqy_6  = mqy_p / 6.0;
+                const mqy_12 = mqy_p / 12.0;
+                const mpxx_4 = mpxx_p / 4.0;
+                const mpxy_4 = mpxy_p / 4.0;
+                f0[offset+0] = r_9 - me_9 + meps_9;
+                f0[offset+1] = r_9 - me_36 - meps_18 + jx_6 - mqx_6 + mpxx_4;
+                f0[offset+2] = r_9 - me_36 - meps_18 + jy_6 - mqy_6 - mpxx_4;
+                f0[offset+3] = r_9 - me_36 - meps_18 - jx_6 + mqx_6 + mpxx_4;
+                f0[offset+4] = r_9 - me_36 - meps_18 - jy_6 + mqy_6 - mpxx_4;
+                f0[offset+5] = r_9 + me_18 + meps_36 + jx_6 + mqx_12 + jy_6 + mqy_12 + mpxy_4;
+                f0[offset+6] = r_9 + me_18 + meps_36 - jx_6 - mqx_12 + jy_6 + mqy_12 - mpxy_4;
+                f0[offset+7] = r_9 + me_18 + meps_36 - jx_6 - mqx_12 - jy_6 - mqy_12 + mpxy_4;
+                f0[offset+8] = r_9 + me_18 + meps_36 + jx_6 + mqx_12 - jy_6 - mqy_12 - mpxy_4;
                 if (thermalEnabled) {
-                    const eDotU = ex[k] * u_real + ey[k] * v_real;
-                    const eDotF = ex[k] * Fx_body + ey[k] * Fy_body;
-                    fpost += guoCoef * w[k] * (3.0 * eDotF + 9.0 * eDotU * eDotF - 3.0 * uDotF);
+                    for (let k = 0; k < 9; k++) {
+                        const eDotU = ex[k] * u_real + ey[k] * v_real;
+                        const eDotF = ex[k] * Fx_body + ey[k] * Fy_body;
+                        f0[offset+k] += guoCoef * w[k] * (3.0 * eDotF + 9.0 * eDotU * eDotF - 3.0 * uDotF);
+                    }
                 }
-                f0[offset+k] = fpost;
+            } else {
+                // BGK
+                for (let k = 0; k < 9; k++) {
+                    const feq = getEquilibrium(r, u_real, v_real, k);
+                    let fpost = f0[offset+k] * (1.0 - omega) + feq * omega;
+                    if (thermalEnabled) {
+                        const eDotU = ex[k] * u_real + ey[k] * v_real;
+                        const eDotF = ex[k] * Fx_body + ey[k] * Fy_body;
+                        fpost += guoCoef * w[k] * (3.0 * eDotF + 9.0 * eDotU * eDotF - 3.0 * uDotF);
+                    }
+                    f0[offset+k] = fpost;
+                }
             }
         }
     }
@@ -2027,6 +2103,7 @@ function encodeStateToHash() {
     qs.set('view',     viewMode);
     if (freeFlightEnabled) qs.set('free', '1');
     if (thermalEnabled) qs.set('thermal', '1');
+    if (mrtEnabled) qs.set('mrt', '1');
     try {
         history.replaceState(null, '', '#' + qs.toString());
     } catch (e) { /* SecurityError in some sandboxed embeds — silently skip */ }
@@ -2070,6 +2147,7 @@ function decodeHashToState() {
     if (v === 'speed' || v === 'vorticity' || v === 'pressure' || v === 'noise' || v === 'temperature') viewMode = v;
     if (qs.get('free') === '1') freeFlightEnabled = true;
     if (qs.get('thermal') === '1') thermalEnabled = true;
+    if (qs.get('mrt') === '1') mrtEnabled = true;
 }
 
 // Push current state values into every UI element. Used after decoding the
@@ -2102,6 +2180,7 @@ function syncUIFromState() {
     document.getElementById('in_aoa').disabled = freeFlightEnabled;
     if (freeFlightEnabled) { aoaContinuous = params.aoa; aoaRate = 0; }
     document.getElementById('btn_thermal').classList.toggle('active', thermalEnabled);
+    document.getElementById('btn_mrt').classList.toggle('active', mrtEnabled);
     const bv = document.getElementById('btn_view');
     bv.innerText = viewMode.charAt(0).toUpperCase() + viewMode.slice(1);
     bv.classList.toggle('active', viewMode !== 'speed');
@@ -2568,6 +2647,7 @@ document.addEventListener('keydown', (e) => {
         'o':       'btn_optimize',
         'g':       'btn_freeflight',
         't':       'btn_thermal',
+        'm':       'btn_mrt',
         'r':       'btn_reset'
     };
     const id = map[k];
@@ -2668,6 +2748,11 @@ document.getElementById('btn_polar').addEventListener('click', function() {
 document.getElementById('btn_audio').addEventListener('click', function() {
     toggleAudio();
     this.classList.toggle('active', audioEnabled);
+});
+
+document.getElementById('btn_mrt').addEventListener('click', function() {
+    mrtEnabled = !mrtEnabled;
+    this.classList.toggle('active', mrtEnabled);
 });
 
 document.getElementById('btn_thermal').addEventListener('click', function() {
