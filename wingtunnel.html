@@ -2760,8 +2760,11 @@ let GPU_RES_IDX = 1;
 let GPU_W = GPU_RES_LEVELS[GPU_RES_IDX][0], GPU_H = GPU_RES_LEVELS[GPU_RES_IDX][1];
 let gpuEnabled = false;
 const gpu = { ok: false, active: false, gl: null, reason: '' };
-const BUILD_TAG = 'gpu-p3'; // bump each deploy so cache staleness is visible on-screen
+const BUILD_TAG = 'gpu-p3b'; // bump each deploy so cache staleness is visible on-screen
 const GPU_PW = 256, GPU_PH = 128; // particle texture → 32768 tracers
+// The GL canvas renders smooth (image-rendering:auto) vs the CPU canvas's
+// pixelated upscale, so it reads ~0.6 less contrasty. Compensate to match.
+const GPU_CONTRAST_OFFSET = 0.6;
 // Substeps auto-scale inversely with cell count, holding per-frame work roughly
 // constant so the highest resolutions stay interactive.
 function gpuSubsteps(){ return Math.max(2, Math.round(6*(1024*512)/(GPU_W*GPU_H))); }
@@ -2960,7 +2963,7 @@ const GPU_PUPDATE_FRAG = `#version 300 es
 precision highp float;
 uniform sampler2D u_pos,u_vel,u_mask;
 uniform vec2 u_dims;
-uniform float u_dt,u_seed;
+uniform float u_dt,u_seed,u_maxAge;
 out vec4 frag;
 float hash(vec2 p){ return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453); }
 void main(){
@@ -2972,7 +2975,7 @@ void main(){
   age += 1.0;
   bool oob = pos.x<0.0||pos.x>1.0||pos.y<0.0||pos.y>1.0;
   float mk = oob?0.0:texture(u_mask,pos).r;
-  if(oob || mk>0.5 || age>600.0){
+  if(oob || mk>0.5 || age>u_maxAge){
     float h1=hash(vec2(gl_FragCoord.xy)+u_seed);
     float h2=hash(vec2(gl_FragCoord.yx)*1.7+vec2(u_seed*0.31));
     pos=vec2(0.01+0.03*h1, 0.02+0.96*h2); // respawn near the inlet
@@ -3003,7 +3006,7 @@ out vec4 frag;
 void main(){
   vec2 d=gl_PointCoord-0.5;
   if(dot(d,d)>0.25) discard;          // round dot
-  float a=clamp(v_age/20.0,0.0,1.0)*clamp((600.0-v_age)/120.0,0.0,1.0);
+  float a=clamp(v_age/15.0,0.0,1.0);  // fade in; respawn handles the tail
   frag=vec4(1.0,1.0,1.0,0.75*a);
 }`;
 
@@ -3259,6 +3262,12 @@ function gpuUpdateParticles(){
   gl.uniform2f(gl.getUniformLocation(gpu.progPUpdate,'u_dims'),GPU_W,GPU_H);
   gl.uniform1f(gl.getUniformLocation(gpu.progPUpdate,'u_dt'),gpuSubsteps());
   gl.uniform1f(gl.getUniformLocation(gpu.progPUpdate,'u_seed'),(stepCount%9973)*0.13);
+  // Lifetime must let a parcel cross the (wide) domain before recycling — scale
+  // it to ~3 domain-traversals at the current inlet speed, so particles exit
+  // downstream (out-of-domain respawn) rather than ageing out at ~25% across.
+  const maxAge = Math.min(30000, Math.max(1000,
+      3.0 * GPU_W / (Math.max(currentInletVel, 0.02) * gpuSubsteps())));
+  gl.uniform1f(gl.getUniformLocation(gpu.progPUpdate,'u_maxAge'), maxAge);
   gl.drawArrays(gl.TRIANGLES,0,6);
   const t=gpu.posRead; gpu.posRead=gpu.posWrite; gpu.posWrite=t;
 }
@@ -3299,7 +3308,8 @@ function gpuRender(){
   gl.uniform1i(gl.getUniformLocation(gpu.progRender,'u_T'),2);
   gl.uniform2f(gl.getUniformLocation(gpu.progRender,'u_dims'),GPU_W,GPU_H);
   gl.uniform1f(gl.getUniformLocation(gpu.progRender,'u_speed'),Math.max(params.speed,0.01));
-  gl.uniform1f(gl.getUniformLocation(gpu.progRender,'u_contrast'),params.contrast);
+  // (contrast compensation applied just below)
+  gl.uniform1f(gl.getUniformLocation(gpu.progRender,'u_contrast'),params.contrast+GPU_CONTRAST_OFFSET);
   const vmap={speed:0,vorticity:1,pressure:2,temperature:3};
   gl.uniform1i(gl.getUniformLocation(gpu.progRender,'u_view'), vmap[viewMode]!==undefined?vmap[viewMode]:0);
   gl.drawArrays(gl.TRIANGLES,0,6);
