@@ -353,7 +353,7 @@
             <button id="btn_freeslip">Free-slip walls</button>
         </div>
         <div class="btn-row" style="margin-top: 6px;">
-            <button id="btn_gpu">⚡ GPU high-res (experimental)</button>
+            <button id="btn_gpu">⚡ GPU high-res</button>
         </div>
         <div id="ctrl_gpu" style="display: none; margin-top: 8px;">
             <label>GPU resolution <span id="disp_gpures" class="val-disp">1024×512</span></label>
@@ -2183,6 +2183,7 @@ function encodeStateToHash() {
     if (thermalEnabled) qs.set('thermal', '1');
     if (mrtEnabled) qs.set('mrt', '1');
     if (freeSlipWalls) qs.set('freeslip', '1');
+    qs.set('solver', gpuEnabled ? 'gpu' : 'cpu');
     try {
         history.replaceState(null, '', '#' + qs.toString());
     } catch (e) { /* SecurityError in some sandboxed embeds — silently skip */ }
@@ -2226,6 +2227,7 @@ function decodeHashToState() {
     if (v === 'speed' || v === 'vorticity' || v === 'pressure' || v === 'noise' || v === 'temperature') viewMode = v;
     if (qs.get('free') === '1') freeFlightEnabled = true;
     if (qs.get('thermal') === '1') thermalEnabled = true;
+    { const sv = qs.get('solver'); if (sv === 'cpu' || sv === 'gpu') solverPref = sv; }
     if (qs.get('mrt') === '1') mrtEnabled = true;
     if (qs.get('freeslip') === '1') freeSlipWalls = true;
 }
@@ -2807,6 +2809,7 @@ const GPU_PW = 256, GPU_PH = 128; // particle texture → 32768 tracers
 const GPU_CONTRAST_OFFSET = 0.6;
 let gpuForceTick = 0; // throttles the (sync) force readback
 let gpuFieldMask = null; // sim-res airfoil/wall mask sampled from the GPU field, for Cp/wake
+let solverPref = 'gpu';  // default solver on load; 'cpu' forces the CPU path. Overridable via #solver=
 // Substeps auto-scale inversely with cell count, holding per-frame work roughly
 // constant so the highest resolutions stay interactive.
 function gpuSubsteps(){ return Math.max(2, Math.round(6*(1024*512)/(GPU_W*GPU_H))); }
@@ -3616,11 +3619,13 @@ function setGpuFeatureLock(on){
   if(note) note.style.display = on ? '' : 'none';
 }
 
-function setGpuEnabled(on){
+function setGpuEnabled(on, silent){
   if(on){
     if(!gpu.ok && !gpuInit()){
-      alert('GPU mode unavailable: '+(gpu.reason||'unknown')+'\\nStaying on the CPU solver.');
+      if(!silent) alert('GPU mode unavailable: '+(gpu.reason||'unknown')+'\\nStaying on the CPU solver.');
+      else console.warn('[GPU] default unavailable ('+(gpu.reason||'unknown')+') — staying on CPU.');
       gpuEnabled=false;
+      solverPref='cpu';
       document.getElementById('btn_gpu').classList.remove('active');
       return;
     }
@@ -3837,6 +3842,10 @@ document.querySelectorAll('.naca-preset').forEach(btn => {
         }
     });
 });
+
+// Default to the GPU solver on capable browsers (silent CPU fallback if WebGL2
+// or float textures are missing). Overridable with #solver=cpu.
+if (solverPref === 'gpu') setGpuEnabled(true, true);
 
 // Start
 requestAnimationFrame(loop);
