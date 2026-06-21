@@ -365,8 +365,8 @@
         </div>
         <div id="gpu_feature_note" style="display:none;font-size:0.62rem;color:var(--accent);opacity:0.8;margin-top:6px;">
             GPU mode runs speed · vorticity · pressure · temperature · particles ·
-            forces (Cl/Cd) · free flight. Cp/wake plots · optimizer · polar · MRT
-            are still CPU-only (ported in later phases).
+            forces (Cl/Cd) · Cp/wake · free flight. Optimizer · polar · MRT are
+            still CPU-only (ported in later phases).
         </div>
 
         <div class="stats" id="simStatus">
@@ -2511,6 +2511,8 @@ function loop() {
                 // Moment rescaled to CPU-grid units so free-flight inertia tuning carries over.
                 const sc = simWidth / GPU_W;
                 Mz_accum = F.mz * sc * sc;
+                // Pull the field down to sim res so Cp/wake plots have data.
+                if (forcesEnabled) gpuReadbackField();
             }
             tickFreeFlight();
             pushHistory();
@@ -2780,7 +2782,7 @@ let GPU_RES_IDX = 1;
 let GPU_W = GPU_RES_LEVELS[GPU_RES_IDX][0], GPU_H = GPU_RES_LEVELS[GPU_RES_IDX][1];
 let gpuEnabled = false;
 const gpu = { ok: false, active: false, gl: null, reason: '' };
-const BUILD_TAG = 'gpu-p4'; // bump each deploy so cache staleness is visible on-screen
+const BUILD_TAG = 'gpu-p4b'; // bump each deploy so cache staleness is visible on-screen
 const GPU_PW = 256, GPU_PH = 128; // particle texture → 32768 tracers
 // The GL canvas renders smooth (image-rendering:auto) vs the CPU canvas's
 // pixelated upscale, so it reads ~0.6 less contrasty. Compensate to match.
@@ -3067,6 +3069,16 @@ void main(){
   frag=vec4(fx,fy,mz,0.0);
 }`;
 
+// Downsample the GPU field (f8,rho,ux,uy) to sim resolution for CPU readback,
+// so the existing Cp(x/c) and wake-profile plots (which read the CPU rho/ux/uy
+// arrays) work unchanged in GPU mode.
+const GPU_DOWNSAMPLE_FRAG = `#version 300 es
+precision highp float;
+uniform sampler2D u_f2;
+in vec2 v_uv;
+out vec4 frag;
+void main(){ frag = texture(u_f2, v_uv); }`;
+
 // Parallel-reduction: each output texel sums the corresponding 2×2 source block.
 const GPU_REDUCE_FRAG = `#version 300 es
 precision highp float;
@@ -3198,6 +3210,19 @@ function gpuInit(){
   gpu.progForce=gpuProgram(gl,GPU_VERT,GPU_FORCE_FRAG);
   gpu.progReduce=gpuProgram(gl,GPU_VERT,GPU_REDUCE_FRAG);
   if(!gpu.progForce||!gpu.progReduce){ gpu.reason='force shader build failed (see console)'; return false; }
+  // Downsample-to-sim-resolution target for Cp/wake plot field readback.
+  gpu.progDownsample=gpuProgram(gl,GPU_VERT,GPU_DOWNSAMPLE_FRAG);
+  if(!gpu.progDownsample){ gpu.reason='downsample shader build failed (see console)'; return false; }
+  { const tex=gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D,tex);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+    gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA32F,simWidth,simHeight,0,gl.RGBA,gl.FLOAT,null);
+    const fbo=gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER,fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,tex,0);
+    gpu.dsTex={tex,fbo}; }
   gpuAllocScratch();
   gpu.ok=true;
   gpuUploadMask();
@@ -3414,6 +3439,25 @@ function gpuComputeForces(){
   return {fx:buf[0], fy:buf[1], mz:buf[2]};
 }
 
+// Downsample the GPU field to sim resolution and copy rho/ux/uy into the CPU
+// arrays, so the existing Cp(x/c) and wake plots work unchanged in GPU mode.
+// Orientation matches: GPU texel cy=0 and CPU array y=0 are both screen-top.
+function gpuReadbackField(){
+  const gl=gpu.gl;
+  gl.useProgram(gpu.progDownsample);
+  gl.bindVertexArray(gpu.vao);
+  gl.bindFramebuffer(gl.FRAMEBUFFER,gpu.dsTex.fbo);
+  gl.drawBuffers([gl.COLOR_ATTACHMENT0]);
+  gl.viewport(0,0,simWidth,simHeight);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,gpu.read.t2);
+  gl.uniform1i(gl.getUniformLocation(gpu.progDownsample,'u_f2'),0);
+  gl.drawArrays(gl.TRIANGLES,0,6);
+  if(!gpu.dsBuf) gpu.dsBuf=new Float32Array(simWidth*simHeight*4);
+  gl.readPixels(0,0,simWidth,simHeight,gl.RGBA,gl.FLOAT,gpu.dsBuf);
+  const b=gpu.dsBuf, n=simWidth*simHeight;
+  for(let i=0;i<n;i++){ rho[i]=b[i*4+1]; ux[i]=b[i*4+2]; uy[i]=b[i*4+3]; }
+}
+
 function gpuRender(){
   const gl=gpu.gl;
   // Match drawing buffer to DEVICE pixels so the high-res field is actually
@@ -3477,6 +3521,9 @@ function drawGpuFrame(){
     const dragX=qx+Cd*armCd;
     drawArrow(ctx,qx,qy,dragX,qy,'#ef4444',2.5);
     ctx.fillStyle='#ef4444'; ctx.fillText('D  Cd='+Cd.toFixed(3),dragX+4,qy+14);
+    // Cp(x/c) + wake profile, now fed by the downsampled GPU field.
+    drawCpPlot(ctx,width,height);
+    drawWakePlot(ctx,width,height);
   }
   drawColorLegend(ctx,width,height);
   // GPU HUD — shows the live state so render bugs are diagnosable at a glance.
