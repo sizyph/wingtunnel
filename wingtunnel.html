@@ -335,6 +335,7 @@
         </div>
         <div class="btn-row" style="margin-top: 6px;">
             <button id="btn_mrt">MRT solver</button>
+            <button id="btn_freeslip">Free-slip walls</button>
         </div>
 
         <div class="stats" id="simStatus">
@@ -349,7 +350,7 @@
             Drag the wing to rotate · drag the flap to deflect it.<br>
             <kbd>space</kbd> pause · <kbd>v</kbd> view · <kbd>p</kbd> particles<br>
             <kbd>f</kbd> forces · <kbd>o</kbd> optimize · <kbd>g</kbd> free flight<br>
-            <kbd>t</kbd> heated wing · <kbd>m</kbd> MRT · <kbd>r</kbd> reset
+            <kbd>t</kbd> heated wing · <kbd>m</kbd> MRT · <kbd>w</kbd> free-slip · <kbd>r</kbd> reset
         </div>
     </div>
 
@@ -379,6 +380,9 @@ const w = new Float32Array([4/9, 1/9, 1/9, 1/9, 1/9, 1/36, 1/36, 1/36, 1/36]);
 const ex = new Int8Array([0, 1, 0, -1, 0, 1, -1, -1, 1]);
 const ey = new Int8Array([0, 0, 1, 0, -1, 1, 1, -1, -1]);
 const opposite = new Uint8Array([0, 3, 4, 1, 2, 7, 8, 5, 6]);
+// Specular reflection across a horizontal wall: flip the y-component, keep x.
+// Used for free-slip channel walls. 2↔4, 5↔8, 6↔7.
+const specular = new Uint8Array([0, 1, 4, 3, 2, 8, 7, 6, 5]);
 
 // Simulation Arrays (Flat Float32 for performance)
 let f0 = new Float32Array(N * 9);
@@ -387,6 +391,8 @@ let rho = new Float32Array(N);
 let ux = new Float32Array(N);
 let uy = new Float32Array(N);
 let barrier = new Uint8Array(N); // 1 = solid, 0 = fluid
+// Previous-step outlet plane for the convective (Sommerfeld) outlet BC.
+let outletPrev = new Float32Array(simHeight * 9);
 
 // State Variables
 let paused = false;
@@ -432,6 +438,11 @@ let mrtEnabled = false;
 const S_E   = 1.4; // energy relaxation
 const S_EPS = 1.4; // energy² relaxation
 const S_Q   = 1.7; // energy-flux relaxation
+
+// Free-slip channel walls (specular reflection) vs. no-slip (bounce-back).
+// Free-slip removes the boundary layer on the top/bottom walls, cutting the
+// ~10% blockage-induced Cl inflation — closer to an open free-stream.
+let freeSlipWalls = false;
 
 // Boussinesq thermal coupling
 let thermalEnabled = false;
@@ -524,6 +535,10 @@ function initFluid() {
         }
         T[i] = T_REF;
         T_new[i] = T_REF;
+    }
+    // Convective-outlet history starts from rest equilibrium.
+    for (let y = 0; y < simHeight; y++) {
+        for (let k = 0; k < 9; k++) outletPrev[y*9 + k] = w[k];
     }
     currentInletVel = 0.0;
     stepCount = 0;
@@ -1567,8 +1582,13 @@ function solve() {
                         const ry = (y + 0.5*ey[k]) - pivotY;
                         mz += rx * fyL - ry * fxL;
                     } else {
-                        // Channel wall — half-way BB, no force tally
-                        f1[i*9 + opposite[k]] = f0[i*9 + k];
+                        // Channel wall — no force tally. Free-slip reflects only
+                        // the wall-normal (y) component; no-slip reverses both.
+                        if (freeSlipWalls) {
+                            f1[i*9 + specular[k]] = f0[i*9 + k];
+                        } else {
+                            f1[i*9 + opposite[k]] = f0[i*9 + k];
+                        }
                     }
                 }
                 // Out-of-domain (e.g. nextX >= simWidth at outlet): particles leave.
@@ -1579,11 +1599,22 @@ function solve() {
     Fy_accum = fy;
     Mz_accum = mz;
 
-    // Outlet Correction (West side handled by Macro override, East side extrapolation)
+    // Convective (Sommerfeld) outlet: ∂f/∂t + U·∂f/∂x = 0, discretized as
+    //   f_end^new = (f_end^old + U·f_pre^new) / (1 + U).
+    // Far less reflective than the old zero-gradient copy — shed vortices
+    // leave the domain cleanly instead of bouncing back upstream. We keep the
+    // previous-step outlet plane in outletPrev.
+    const Uc = Math.max(currentInletVel, 1e-3);
+    const ocoef = 1.0 / (1.0 + Uc);
     for(let y=1; y<simHeight-1; y++) {
         const end = (simWidth-1) + y*simWidth;
         const pre = (simWidth-2) + y*simWidth;
-        for(let k=0; k<9; k++) f1[end*9+k] = f1[pre*9+k];
+        const ob = y*9;
+        for(let k=0; k<9; k++) {
+            const val = (outletPrev[ob+k] + Uc * f1[pre*9+k]) * ocoef;
+            f1[end*9+k] = val;
+            outletPrev[ob+k] = val;
+        }
     }
 
     // Swap
@@ -2104,6 +2135,7 @@ function encodeStateToHash() {
     if (freeFlightEnabled) qs.set('free', '1');
     if (thermalEnabled) qs.set('thermal', '1');
     if (mrtEnabled) qs.set('mrt', '1');
+    if (freeSlipWalls) qs.set('freeslip', '1');
     try {
         history.replaceState(null, '', '#' + qs.toString());
     } catch (e) { /* SecurityError in some sandboxed embeds — silently skip */ }
@@ -2148,6 +2180,7 @@ function decodeHashToState() {
     if (qs.get('free') === '1') freeFlightEnabled = true;
     if (qs.get('thermal') === '1') thermalEnabled = true;
     if (qs.get('mrt') === '1') mrtEnabled = true;
+    if (qs.get('freeslip') === '1') freeSlipWalls = true;
 }
 
 // Push current state values into every UI element. Used after decoding the
@@ -2181,6 +2214,7 @@ function syncUIFromState() {
     if (freeFlightEnabled) { aoaContinuous = params.aoa; aoaRate = 0; }
     document.getElementById('btn_thermal').classList.toggle('active', thermalEnabled);
     document.getElementById('btn_mrt').classList.toggle('active', mrtEnabled);
+    document.getElementById('btn_freeslip').classList.toggle('active', freeSlipWalls);
     const bv = document.getElementById('btn_view');
     bv.innerText = viewMode.charAt(0).toUpperCase() + viewMode.slice(1);
     bv.classList.toggle('active', viewMode !== 'speed');
@@ -2648,6 +2682,7 @@ document.addEventListener('keydown', (e) => {
         'g':       'btn_freeflight',
         't':       'btn_thermal',
         'm':       'btn_mrt',
+        'w':       'btn_freeslip',
         'r':       'btn_reset'
     };
     const id = map[k];
@@ -2753,6 +2788,11 @@ document.getElementById('btn_audio').addEventListener('click', function() {
 document.getElementById('btn_mrt').addEventListener('click', function() {
     mrtEnabled = !mrtEnabled;
     this.classList.toggle('active', mrtEnabled);
+});
+
+document.getElementById('btn_freeslip').addEventListener('click', function() {
+    freeSlipWalls = !freeSlipWalls;
+    this.classList.toggle('active', freeSlipWalls);
 });
 
 document.getElementById('btn_thermal').addEventListener('click', function() {
