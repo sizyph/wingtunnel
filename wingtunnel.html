@@ -364,8 +364,9 @@
             </div>
         </div>
         <div id="gpu_feature_note" style="display:none;font-size:0.62rem;color:var(--accent);opacity:0.8;margin-top:6px;">
-            GPU mode runs speed · vorticity · pressure · temperature · particles.
-            Forces · Cp · optimizer · MRT are paused (CPU-only — ported in later phases).
+            GPU mode runs speed · vorticity · pressure · temperature · particles ·
+            forces (Cl/Cd) · free flight. Cp/wake plots · optimizer · polar · MRT
+            are still CPU-only (ported in later phases).
         </div>
 
         <div class="stats" id="simStatus">
@@ -2494,6 +2495,25 @@ function loop() {
             for (let k = 0; k < ns; k++) gpuStep();
             stepCount += ns;
             if (particlesEnabled) gpuUpdateParticles();
+            // Aerodynamic forces from the GPU field (throttled — readback syncs).
+            if ((forcesEnabled || freeFlightEnabled) && (++gpuForceTick % 3 === 0)) {
+                const F = gpuComputeForces();
+                const chordGpu = airfoilChord * (GPU_W / simWidth);
+                const q = 0.5 * currentInletVel * currentInletVel;
+                if (q > 1e-6 && chordGpu > 0) {
+                    let cl = -F.fy / (q * chordGpu);   // screen-y flip, as on CPU
+                    let cd =  F.fx / (q * chordGpu);
+                    if (cl > 10) cl = 10; else if (cl < -10) cl = -10;
+                    if (cd > 10) cd = 10; else if (cd < -10) cd = -10;
+                    Cl = 0.9 * Cl + 0.1 * cl;
+                    Cd = 0.9 * Cd + 0.1 * cd;
+                }
+                // Moment rescaled to CPU-grid units so free-flight inertia tuning carries over.
+                const sc = simWidth / GPU_W;
+                Mz_accum = F.mz * sc * sc;
+            }
+            tickFreeFlight();
+            pushHistory();
         } else {
             for(let k=0; k<8; k++) solve();
             if (!checkStability()) {
@@ -2760,11 +2780,12 @@ let GPU_RES_IDX = 1;
 let GPU_W = GPU_RES_LEVELS[GPU_RES_IDX][0], GPU_H = GPU_RES_LEVELS[GPU_RES_IDX][1];
 let gpuEnabled = false;
 const gpu = { ok: false, active: false, gl: null, reason: '' };
-const BUILD_TAG = 'gpu-p3b'; // bump each deploy so cache staleness is visible on-screen
+const BUILD_TAG = 'gpu-p4'; // bump each deploy so cache staleness is visible on-screen
 const GPU_PW = 256, GPU_PH = 128; // particle texture → 32768 tracers
 // The GL canvas renders smooth (image-rendering:auto) vs the CPU canvas's
 // pixelated upscale, so it reads ~0.6 less contrasty. Compensate to match.
 const GPU_CONTRAST_OFFSET = 0.6;
+let gpuForceTick = 0; // throttles the (sync) force readback
 // Substeps auto-scale inversely with cell count, holding per-frame work roughly
 // constant so the highest resolutions stay interactive.
 function gpuSubsteps(){ return Math.max(2, Math.round(6*(1024*512)/(GPU_W*GPU_H))); }
@@ -3010,6 +3031,58 @@ void main(){
   frag=vec4(1.0,1.0,1.0,0.75*a);
 }`;
 
+// Per-cell aerodynamic force: momentum exchange on links pointing into the
+// airfoil (halfway bounce-back → F_link = 2·f_a·e_a). Outputs (fx,fy,mz,0)
+// per fluid cell; a reduction then sums them to a single (Fx,Fy,Mz).
+const GPU_FORCE_FRAG = `#version 300 es
+precision highp float;
+${GPU_COMMON}
+uniform sampler2D u_f0,u_f1,u_f2,u_mask;
+uniform vec2 u_dims,u_pivot;
+out vec4 frag;
+float fa(ivec2 c,int a){
+  if(a<4) return texelFetch(u_f0,c,0)[a];
+  else if(a<8) return texelFetch(u_f1,c,0)[a-4];
+  return texelFetch(u_f2,c,0).x;
+}
+void main(){
+  ivec2 c=ivec2(gl_FragCoord.xy);
+  int W=int(u_dims.x),H=int(u_dims.y);
+  float fx=0.0,fy=0.0,mz=0.0;
+  if(texelFetch(u_mask,c,0).r<0.5){
+    for(int a=1;a<9;a++){
+      ivec2 nb=ivec2(c.x+exq[a],c.y+eyq[a]);
+      bool inb=nb.x>=0&&nb.x<W&&nb.y>=0&&nb.y<H;
+      if(inb && texelFetch(u_mask,nb,0).r>1.5){ // airfoil neighbour
+        float fav=fa(c,a);
+        float cx=2.0*fav*float(exq[a]);
+        float cy=2.0*fav*float(eyq[a]);
+        fx+=cx; fy+=cy;
+        float rx=(float(c.x)+0.5*float(exq[a]))-u_pivot.x;
+        float ry=(float(c.y)+0.5*float(eyq[a]))-u_pivot.y;
+        mz+=rx*cy-ry*cx;
+      }
+    }
+  }
+  frag=vec4(fx,fy,mz,0.0);
+}`;
+
+// Parallel-reduction: each output texel sums the corresponding 2×2 source block.
+const GPU_REDUCE_FRAG = `#version 300 es
+precision highp float;
+uniform sampler2D u_src;
+uniform ivec2 u_srcdims;
+out vec4 frag;
+void main(){
+  ivec2 s=ivec2(gl_FragCoord.xy)*2;
+  vec4 sum=vec4(0.0);
+  for(int dy=0;dy<2;dy++) for(int dx=0;dx<2;dx++){
+    ivec2 p=s+ivec2(dx,dy);
+    if(p.x<u_srcdims.x && p.y<u_srcdims.y) sum+=texelFetch(u_src,p,0);
+  }
+  frag=sum;
+}`;
+
 function gpuCompile(gl, type, src){
   const s=gl.createShader(type); gl.shaderSource(s,src); gl.compileShader(s);
   if(!gl.getShaderParameter(s,gl.COMPILE_STATUS)){
@@ -3121,6 +3194,11 @@ function gpuInit(){
   if(!gpu.progPUpdate||!gpu.progPRender){ gpu.reason='particle shader build failed (see console)'; return false; }
   gpu.pvao=gl.createVertexArray(); // attribute-less VAO for gl_VertexID point draws
   gpu.posRead=null; gpu.posWrite=null;
+  // Force (Cl/Cd/moment) program + reduction program + scratch targets.
+  gpu.progForce=gpuProgram(gl,GPU_VERT,GPU_FORCE_FRAG);
+  gpu.progReduce=gpuProgram(gl,GPU_VERT,GPU_REDUCE_FRAG);
+  if(!gpu.progForce||!gpu.progReduce){ gpu.reason='force shader build failed (see console)'; return false; }
+  gpuAllocScratch();
   gpu.ok=true;
   gpuUploadMask();
   console.log('[GPU] WebGL2 LBM ready — '+GPU_W+'×'+GPU_H+', '+gpuSubsteps()+' substeps/frame');
@@ -3168,6 +3246,7 @@ function gpuSetResolution(idx){
   if(gpu.ok){
     gpuResetField();   // recreates sets at the new size (also reseeds at rest)
     gpuUploadMask();   // rebuild mask at the new size
+    gpuAllocScratch(); // force/reduction scratch must match the new size
   }
 }
 
@@ -3286,6 +3365,55 @@ function gpuRenderParticles(){
   gl.disable(gl.BLEND);
 }
 
+function gpuAllocScratch(){
+  const gl=gpu.gl;
+  gpuDeleteT(gpu.forceTex); gpuDeleteT(gpu.reductA); gpuDeleteT(gpu.reductB);
+  gpu.forceTex=gpuMakeT(gl); gpu.reductA=gpuMakeT(gl); gpu.reductB=gpuMakeT(gl);
+}
+
+// Compute (Fx,Fy,Mz) on the airfoil by a per-cell momentum-exchange pass
+// followed by a parallel reduction to a single texel, read back (1px).
+function gpuComputeForces(){
+  const gl=gpu.gl;
+  // 1) per-cell force → forceTex
+  gl.useProgram(gpu.progForce);
+  gl.bindVertexArray(gpu.vao);
+  gl.viewport(0,0,GPU_W,GPU_H);
+  gl.bindFramebuffer(gl.FRAMEBUFFER,gpu.forceTex.fbo);
+  gl.drawBuffers([gl.COLOR_ATTACHMENT0]);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,gpu.read.t0);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D,gpu.read.t1);
+  gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D,gpu.read.t2);
+  gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D,gpu.maskTex);
+  gl.uniform1i(gl.getUniformLocation(gpu.progForce,'u_f0'),0);
+  gl.uniform1i(gl.getUniformLocation(gpu.progForce,'u_f1'),1);
+  gl.uniform1i(gl.getUniformLocation(gpu.progForce,'u_f2'),2);
+  gl.uniform1i(gl.getUniformLocation(gpu.progForce,'u_mask'),3);
+  gl.uniform2f(gl.getUniformLocation(gpu.progForce,'u_dims'),GPU_W,GPU_H);
+  gl.uniform2f(gl.getUniformLocation(gpu.progForce,'u_pivot'),GPU_W*0.25,GPU_H*0.5);
+  gl.drawArrays(gl.TRIANGLES,0,6);
+  // 2) reduce to 1×1
+  gl.useProgram(gpu.progReduce);
+  let src=gpu.forceTex, srcW=GPU_W, srcH=GPU_H;
+  while(srcW>1 || srcH>1){
+    const ow=Math.max(1,Math.ceil(srcW/2)), oh=Math.max(1,Math.ceil(srcH/2));
+    const dst=(src===gpu.reductA)?gpu.reductB:gpu.reductA;
+    gl.bindFramebuffer(gl.FRAMEBUFFER,dst.fbo);
+    gl.drawBuffers([gl.COLOR_ATTACHMENT0]);
+    gl.viewport(0,0,ow,oh);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,src.tex);
+    gl.uniform1i(gl.getUniformLocation(gpu.progReduce,'u_src'),0);
+    gl.uniform2i(gl.getUniformLocation(gpu.progReduce,'u_srcdims'),srcW,srcH);
+    gl.drawArrays(gl.TRIANGLES,0,6);
+    src=dst; srcW=ow; srcH=oh;
+  }
+  // 3) read the single accumulated texel
+  gl.bindFramebuffer(gl.FRAMEBUFFER,src.fbo);
+  const buf=new Float32Array(4);
+  gl.readPixels(0,0,1,1,gl.RGBA,gl.FLOAT,buf);
+  return {fx:buf[0], fy:buf[1], mz:buf[2]};
+}
+
 function gpuRender(){
   const gl=gpu.gl;
   // Match drawing buffer to DEVICE pixels so the high-res field is actually
@@ -3333,6 +3461,23 @@ function drawGpuFrame(){
     strokePoly(airfoilPolygon,"#e0e0e0");
     for(const p of extraPolygons) strokePoly(p,"#c8b8a8");
   }
+  // Force vectors (Cl/Cd from the GPU reduction). Cp/wake plots need full-field
+  // readback and are still CPU-only, so they're not drawn here.
+  if(forcesEnabled && airfoilChord>0){
+    const sX=width/simWidth, sY=height/simHeight;
+    const lex=airfoilLE.x*sX, ley=airfoilLE.y*sY, tex=airfoilTE.x*sX, tey=airfoilTE.y*sY;
+    ctx.setLineDash([5,4]); ctx.strokeStyle='#ffd166'; ctx.lineWidth=1.5;
+    ctx.beginPath(); ctx.moveTo(lex,ley); ctx.lineTo(tex,tey); ctx.stroke(); ctx.setLineDash([]);
+    const qx=lex+(tex-lex)*0.25, qy=ley+(tey-ley)*0.25;
+    const armCl=airfoilChord*0.5*sX, armCd=airfoilChord*2.0*sX;
+    const liftY=qy-Cl*armCl;
+    drawArrow(ctx,qx,qy,qx,liftY,'#4ade80',2.5);
+    ctx.font='11px monospace'; ctx.textAlign='left';
+    ctx.fillStyle='#4ade80'; ctx.fillText('L  Cl='+Cl.toFixed(2),qx+6,Cl>=0?liftY-4:liftY+12);
+    const dragX=qx+Cd*armCd;
+    drawArrow(ctx,qx,qy,dragX,qy,'#ef4444',2.5);
+    ctx.fillStyle='#ef4444'; ctx.fillText('D  Cd='+Cd.toFixed(3),dragX+4,qy+14);
+  }
   drawColorLegend(ctx,width,height);
   // GPU HUD — shows the live state so render bugs are diagnosable at a glance.
   ctx.textAlign='left';
@@ -3347,8 +3492,7 @@ function drawGpuFrame(){
 // CPU-only features that are inert while the GPU solver runs (phase 1). Grey
 // them out so it's clear they're unavailable rather than silently broken.
 function setGpuFeatureLock(on){
-  const ids=['btn_forces','btn_optimize',
-             'btn_freeflight','btn_polar','btn_audio','btn_mrt','btn_freeslip'];
+  const ids=['btn_optimize','btn_polar','btn_audio','btn_mrt','btn_freeslip'];
   ids.forEach(id=>{ const el=document.getElementById(id); if(el) el.disabled=on; });
   const note=document.getElementById('gpu_feature_note');
   if(note) note.style.display = on ? '' : 'none';
