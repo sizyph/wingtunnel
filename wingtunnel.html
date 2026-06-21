@@ -364,8 +364,8 @@
             </div>
         </div>
         <div id="gpu_feature_note" style="display:none;font-size:0.62rem;color:var(--accent);opacity:0.8;margin-top:6px;">
-            In GPU mode, forces · Cp · particles · thermal · optimizer · MRT are paused
-            (CPU-only for now — being ported in later phases).
+            GPU mode runs speed · vorticity · pressure · temperature. Forces · Cp ·
+            particles · optimizer · MRT are paused (CPU-only — ported in later phases).
         </div>
 
         <div class="stats" id="simStatus">
@@ -2783,9 +2783,9 @@ float feq(float r,float u,float v,int k){
 const GPU_STEP_FRAG = `#version 300 es
 precision highp float;
 ${GPU_COMMON}
-uniform sampler2D u_f0,u_f1,u_f2,u_mask;
+uniform sampler2D u_f0,u_f1,u_f2,u_mask,u_T;
 uniform vec2 u_dims;
-uniform float u_uin,u_tau0,u_smag;
+uniform float u_uin,u_tau0,u_smag,u_buoy;
 layout(location=0) out vec4 o0;
 layout(location=1) out vec4 o1;
 layout(location=2) out vec4 o2;
@@ -2839,20 +2839,34 @@ void main(){
   float r=0.0,u=0.0,v=0.0;
   for(int j=0;j<9;j++){ r+=f[j]; u+=f[j]*float(exq[j]); v+=f[j]*float(eyq[j]); }
   u/=r; v/=r;
-  // Smagorinsky eddy viscosity
+  // Boussinesq buoyancy (vertical). c.y increases toward screen-bottom, so an
+  // upward force on hot fluid is along -ey → Fy = -u_buoy*(T-Tref), Tref=0.
+  // u_buoy=0 makes the whole block bit-identical to the non-thermal path.
+  float Fy = -u_buoy * texelFetch(u_T,c,0).r;
+  float ur=u, vr=v + 0.5*Fy/r; // Guo-corrected velocity
+  // Smagorinsky eddy viscosity (on the corrected velocity)
   float Qxx=0.0,Qxy=0.0,Qyy=0.0;
-  for(int j=0;j<9;j++){ float fe=feq(r,u,v,j); float fn=f[j]-fe;
+  for(int j=0;j<9;j++){ float fe=feq(r,ur,vr,j); float fn=f[j]-fe;
     Qxx+=float(exq[j]*exq[j])*fn; Qxy+=float(exq[j]*eyq[j])*fn; Qyy+=float(eyq[j]*eyq[j])*fn; }
   float Pi=sqrt(Qxx*Qxx+2.0*Qxy*Qxy+Qyy*Qyy);
   float tau_add=0.5*(sqrt(u_tau0*u_tau0+18.0*u_smag*u_smag*Pi/r)-u_tau0);
   float omega=1.0/(u_tau0+tau_add);
-  for(int j=0;j<9;j++){ float fe=feq(r,u,v,j); f[j]=f[j]*(1.0-omega)+fe*omega; }
-  o0=vec4(f[0],f[1],f[2],f[3]); o1=vec4(f[4],f[5],f[6],f[7]); o2=vec4(f[8],r,u,v);
+  float gco=1.0-0.5*omega;
+  float uDotF = vr*Fy;            // Fx=0
+  for(int j=0;j<9;j++){
+    float fe=feq(r,ur,vr,j);
+    float fp=f[j]*(1.0-omega)+fe*omega;
+    float eF=float(eyq[j])*Fy;
+    float eU=float(exq[j])*ur+float(eyq[j])*vr;
+    fp += gco*wq[j]*(3.0*eF + 9.0*eU*eF - 3.0*uDotF);
+    f[j]=fp;
+  }
+  o0=vec4(f[0],f[1],f[2],f[3]); o1=vec4(f[4],f[5],f[6],f[7]); o2=vec4(f[8],r,ur,vr);
 }`;
 
 const GPU_RENDER_FRAG = `#version 300 es
 precision highp float;
-uniform sampler2D u_f2,u_mask;
+uniform sampler2D u_f2,u_mask,u_T;
 uniform vec2 u_dims;
 uniform float u_speed,u_contrast;
 uniform int u_view;
@@ -2865,17 +2879,26 @@ vec3 turbo(float t){ t=clamp(t,0.0,1.0);
 vec3 diverging(float t){ t=clamp(t,-1.0,1.0);
   if(t>=0.0) return mix(vec3(0.969),vec3(0.698,0.094,0.169),t);
   return mix(vec3(0.969),vec3(0.129,0.400,0.675),-t); }
+vec3 hot(float t){ t=clamp(t,0.0,1.0);
+  return vec3(clamp(t*2.0,0.0,1.0), clamp((t-0.33)*2.0,0.0,1.0), clamp((t-0.66)*2.94,0.0,1.0)); }
 void main(){
   // canvas-top (v_uv.y=1) maps to screen-top = field row 0 = GL texel-y 0.
   int cx=int(v_uv.x*u_dims.x);
   int cy=int((1.0-v_uv.y)*u_dims.y);
   cx=clamp(cx,0,int(u_dims.x)-1); cy=clamp(cy,0,int(u_dims.y)-1);
   ivec2 c=ivec2(cx,cy);
-  if(texelFetch(u_mask,c,0).r>0.5){ frag=vec4(0.157,0.157,0.157,1.0); return; }
+  float mk=texelFetch(u_mask,c,0).r;
+  if(mk>0.5){
+    if(u_view==3 && mk>1.5) frag=vec4(0.70,0.24,0.16,1.0); // hot wing in temperature view
+    else frag=vec4(0.157,0.157,0.157,1.0);
+    return;
+  }
   vec4 d=texelFetch(u_f2,c,0); // (f8, rho, ux, uy)
   float rho=d.y, ux=d.z, uy=d.w;
   vec3 col;
-  if(u_view==1){ // vorticity
+  if(u_view==3){ // temperature
+    col=hot(texelFetch(u_T,c,0).r*u_contrast);
+  } else if(u_view==1){ // vorticity
     int W=int(u_dims.x),H=int(u_dims.y);
     float uyR=texelFetch(u_f2,ivec2(min(cx+1,W-1),cy),0).w;
     float uyL=texelFetch(u_f2,ivec2(max(cx-1,0),cy),0).w;
@@ -2895,6 +2918,35 @@ void main(){
     col=turbo(nrm);
   }
   frag=vec4(col,1.0);
+}`;
+
+// Boussinesq temperature: upwind advection + central diffusion, one R-channel.
+// Airfoil = hot Dirichlet (1), walls/inlet = cold (0), outlet = zero-gradient.
+const GPU_THERMAL_FRAG = `#version 300 es
+precision highp float;
+uniform sampler2D u_T,u_vel,u_mask;
+uniform vec2 u_dims;
+uniform float u_alpha;
+out vec4 frag;
+void main(){
+  ivec2 c=ivec2(gl_FragCoord.xy);
+  int W=int(u_dims.x),H=int(u_dims.y);
+  float mk=texelFetch(u_mask,c,0).r;
+  if(mk>1.5){ frag=vec4(1.0,0.0,0.0,0.0); return; } // airfoil hot
+  if(mk>0.5){ frag=vec4(0.0); return; }             // wall cold
+  if(c.x==0){ frag=vec4(0.0); return; }             // inlet cold
+  if(c.x==W-1){ frag=vec4(texelFetch(u_T,ivec2(c.x-1,c.y),0).r,0.0,0.0,0.0); return; }
+  float T=texelFetch(u_T,c,0).r;
+  float TR=texelFetch(u_T,ivec2(c.x+1,c.y),0).r;
+  float TL=texelFetch(u_T,ivec2(c.x-1,c.y),0).r;
+  float TU=texelFetch(u_T,ivec2(c.x,c.y+1),0).r;
+  float TD=texelFetch(u_T,ivec2(c.x,c.y-1),0).r;
+  vec4 vel=texelFetch(u_vel,c,0); float u=vel.z, v=vel.w;
+  float dTdx = u>0.0 ? (T-TL) : (TR-T);
+  float dTdy = v>0.0 ? (T-TD) : (TU-T);
+  float lap = TR+TL+TU+TD-4.0*T;
+  float nT = T - u*dTdx - v*dTdy + u_alpha*lap;
+  frag=vec4(clamp(nT,0.0,1.05),0.0,0.0,0.0);
 }`;
 
 function gpuCompile(gl, type, src){
@@ -2998,10 +3050,26 @@ function gpuInit(){
   gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.NEAREST);
   gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
   gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+  // Temperature ping-pong (Boussinesq) + its advection-diffusion program.
+  gpu.progThermal=gpuProgram(gl,GPU_VERT,GPU_THERMAL_FRAG);
+  if(!gpu.progThermal){ gpu.reason='thermal shader build failed (see console)'; return false; }
+  gpu.Tread=gpuMakeT(gl); gpu.Twrite=gpuMakeT(gl);
   gpu.ok=true;
   gpuUploadMask();
   console.log('[GPU] WebGL2 LBM ready — '+GPU_W+'×'+GPU_H+', '+gpuSubsteps()+' substeps/frame');
   return true;
+}
+
+function gpuMakeT(gl){
+  const tex=gpuMakeFieldTex(gl, new Float32Array(GPU_W*GPU_H*4)); // 0 = T_REF
+  const fbo=gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER,fbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,tex,0);
+  return {tex,fbo};
+}
+function gpuDeleteT(s){
+  if(!s||!gpu.gl) return;
+  gpu.gl.deleteTexture(s.tex); gpu.gl.deleteFramebuffer(s.fbo);
 }
 
 function gpuDeleteSet(s){
@@ -3018,6 +3086,9 @@ function gpuResetField(){
   gpuDeleteSet(gpu.setA); gpuDeleteSet(gpu.setB);
   gpu.setA=gpuMakeSet(gl); gpu.setB=gpuMakeSet(gl);
   gpu.read=gpu.setA; gpu.write=gpu.setB;
+  // Reset temperature to ambient.
+  gpuDeleteT(gpu.Tread); gpuDeleteT(gpu.Twrite);
+  gpu.Tread=gpuMakeT(gl); gpu.Twrite=gpuMakeT(gl);
 }
 
 // Change the GPU lattice resolution and rebuild the textures/mask at the new size.
@@ -3044,16 +3115,39 @@ function gpuStep(){
   gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D,gpu.read.t1);
   gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D,gpu.read.t2);
   gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D,gpu.maskTex);
+  gl.activeTexture(gl.TEXTURE4); gl.bindTexture(gl.TEXTURE_2D,gpu.Tread.tex);
   gl.uniform1i(gl.getUniformLocation(gpu.progStep,'u_f0'),0);
   gl.uniform1i(gl.getUniformLocation(gpu.progStep,'u_f1'),1);
   gl.uniform1i(gl.getUniformLocation(gpu.progStep,'u_f2'),2);
   gl.uniform1i(gl.getUniformLocation(gpu.progStep,'u_mask'),3);
+  gl.uniform1i(gl.getUniformLocation(gpu.progStep,'u_T'),4);
   gl.uniform2f(gl.getUniformLocation(gpu.progStep,'u_dims'),GPU_W,GPU_H);
   gl.uniform1f(gl.getUniformLocation(gpu.progStep,'u_uin'),currentInletVel);
   gl.uniform1f(gl.getUniformLocation(gpu.progStep,'u_tau0'),3.0*params.viscosity+0.5);
   gl.uniform1f(gl.getUniformLocation(gpu.progStep,'u_smag'),params.smagorinsky);
+  gl.uniform1f(gl.getUniformLocation(gpu.progStep,'u_buoy'), thermalEnabled?G_BUOYANCY:0.0);
   gl.drawArrays(gl.TRIANGLES,0,6);
   const t=gpu.read; gpu.read=gpu.write; gpu.write=t; // swap
+  if(thermalEnabled) gpuStepThermal();
+}
+
+function gpuStepThermal(){
+  const gl=gpu.gl;
+  gl.useProgram(gpu.progThermal);
+  gl.bindVertexArray(gpu.vao);
+  gl.viewport(0,0,GPU_W,GPU_H);
+  gl.bindFramebuffer(gl.FRAMEBUFFER,gpu.Twrite.fbo);
+  gl.drawBuffers([gl.COLOR_ATTACHMENT0]);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,gpu.Tread.tex);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D,gpu.read.t2); // post-step velocity
+  gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D,gpu.maskTex);
+  gl.uniform1i(gl.getUniformLocation(gpu.progThermal,'u_T'),0);
+  gl.uniform1i(gl.getUniformLocation(gpu.progThermal,'u_vel'),1);
+  gl.uniform1i(gl.getUniformLocation(gpu.progThermal,'u_mask'),2);
+  gl.uniform2f(gl.getUniformLocation(gpu.progThermal,'u_dims'),GPU_W,GPU_H);
+  gl.uniform1f(gl.getUniformLocation(gpu.progThermal,'u_alpha'),T_DIFFUSIVITY);
+  gl.drawArrays(gl.TRIANGLES,0,6);
+  const t=gpu.Tread; gpu.Tread=gpu.Twrite; gpu.Twrite=t; // swap
 }
 
 function gpuRender(){
@@ -3068,12 +3162,14 @@ function gpuRender(){
   gl.viewport(0,0,glCanvas.width,glCanvas.height);
   gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,gpu.read.t2);
   gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D,gpu.maskTex);
+  gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D,gpu.Tread.tex);
   gl.uniform1i(gl.getUniformLocation(gpu.progRender,'u_f2'),0);
   gl.uniform1i(gl.getUniformLocation(gpu.progRender,'u_mask'),1);
+  gl.uniform1i(gl.getUniformLocation(gpu.progRender,'u_T'),2);
   gl.uniform2f(gl.getUniformLocation(gpu.progRender,'u_dims'),GPU_W,GPU_H);
   gl.uniform1f(gl.getUniformLocation(gpu.progRender,'u_speed'),Math.max(params.speed,0.01));
   gl.uniform1f(gl.getUniformLocation(gpu.progRender,'u_contrast'),params.contrast);
-  const vmap={speed:0,vorticity:1,pressure:2};
+  const vmap={speed:0,vorticity:1,pressure:2,temperature:3};
   gl.uniform1i(gl.getUniformLocation(gpu.progRender,'u_view'), vmap[viewMode]!==undefined?vmap[viewMode]:0);
   gl.drawArrays(gl.TRIANGLES,0,6);
 }
@@ -3106,7 +3202,7 @@ function drawGpuFrame(){
 // CPU-only features that are inert while the GPU solver runs (phase 1). Grey
 // them out so it's clear they're unavailable rather than silently broken.
 function setGpuFeatureLock(on){
-  const ids=['btn_particles','btn_forces','btn_thermal','btn_optimize',
+  const ids=['btn_particles','btn_forces','btn_optimize',
              'btn_freeflight','btn_polar','btn_audio','btn_mrt','btn_freeslip'];
   ids.forEach(id=>{ const el=document.getElementById(id); if(el) el.disabled=on; });
   const note=document.getElementById('gpu_feature_note');
@@ -3121,8 +3217,8 @@ function setGpuEnabled(on){
       document.getElementById('btn_gpu').classList.remove('active');
       return;
     }
-    // GPU render handles speed/vorticity/pressure only (phase 1).
-    if(viewMode!=='speed'&&viewMode!=='vorticity'&&viewMode!=='pressure'){
+    // GPU render handles speed/vorticity/pressure/temperature.
+    if(viewMode==='noise'){
       viewMode='speed';
       const bv=document.getElementById('btn_view');
       bv.innerText='Speed'; bv.classList.remove('active');
@@ -3191,7 +3287,7 @@ document.getElementById('btn_view').addEventListener('click', function() {
     // Button label shows the CURRENT mode (matches the bottom-left legend).
     if (viewMode === 'speed') viewMode = 'vorticity';
     else if (viewMode === 'vorticity') viewMode = 'pressure';
-    else if (viewMode === 'pressure') viewMode = 'noise';
+    else if (viewMode === 'pressure') viewMode = gpu.active ? 'temperature' : 'noise'; // GPU has no noise view
     else if (viewMode === 'noise') viewMode = 'temperature';
     else viewMode = 'speed';
     this.innerText = viewMode.charAt(0).toUpperCase() + viewMode.slice(1);
@@ -3259,8 +3355,9 @@ document.getElementById('btn_thermal').addEventListener('click', function() {
     thermalEnabled = !thermalEnabled;
     this.classList.toggle('active', thermalEnabled);
     if (thermalEnabled) {
-        // Re-zero T so the field starts clean and the plume develops visibly.
+        // Re-zero T (CPU and GPU) so the field starts clean and the plume develops.
         for (let i = 0; i < N; i++) { T[i] = T_REF; T_new[i] = T_REF; }
+        if (gpu.ok) { gpuDeleteT(gpu.Tread); gpuDeleteT(gpu.Twrite); gpu.Tread=gpuMakeT(gpu.gl); gpu.Twrite=gpuMakeT(gpu.gl); }
         // Jump to Temperature view so the effect is immediately visible.
         viewMode = 'temperature';
         const bv = document.getElementById('btn_view');
