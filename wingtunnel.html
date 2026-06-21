@@ -365,8 +365,8 @@
         </div>
         <div id="gpu_feature_note" style="display:none;font-size:0.62rem;color:var(--accent);opacity:0.8;margin-top:6px;">
             GPU mode runs speed · vorticity · pressure · temperature · particles ·
-            forces (Cl/Cd) · Cp/wake · free flight. Optimizer · polar · MRT are
-            still CPU-only (ported in later phases).
+            forces (Cl/Cd) · Cp/wake · free flight · optimizer · polar. MRT and
+            Kármán tone are still CPU-only.
         </div>
 
         <div class="stats" id="simStatus">
@@ -577,6 +577,12 @@ function initFluid() {
     }
     currentInletVel = 0.0;
     stepCount = 0;
+}
+
+// Reset whichever solver is active — used by the optimizer/polar between trials.
+function resetSolverField(){
+    initFluid();
+    if (gpu.active) gpuResetField();
 }
 
 // Boussinesq temperature update: ∂T/∂t + u·∇T = α∇²T, explicit Euler with
@@ -1049,7 +1055,7 @@ function startOptimize() {
     optimizer.measureFrames = 0;
     optimizer.sumCl = 0;
     optimizer.sumCd = 0;
-    initFluid();
+    resetSolverField();
     const btn = document.getElementById('btn_optimize');
     btn.classList.add('active');
     btn.innerText = 'Stop';
@@ -1077,7 +1083,7 @@ function nextTrial(revertNeeded) {
     if (revertNeeded) applyOptParams(optimizer.best);
     optimizer.trial = perturbParams(optimizer.best);
     applyOptParams(optimizer.trial);
-    initFluid();
+    resetSolverField();
     optimizer.phase = 'settle';
     optimizer.settleFrames = 0;
     optimizer.measureFrames = 0;
@@ -1099,7 +1105,7 @@ function tickOptimizer() {
             // Candidate diverged — recover and reject it as a worse-than-best trial.
             unstable = false;
             paused = false;
-            initFluid();
+            resetSolverField();
             nextTrial(true);
             return;
         }
@@ -1184,7 +1190,7 @@ function startPolar() {
     polar.sumCd = 0;
     polar.data = [];
     setPolarAoa(polar.currentAoa);
-    initFluid();
+    resetSolverField();
     const btn = document.getElementById('btn_polar');
     btn.classList.add('active');
     btn.innerText = 'Stop';
@@ -1231,7 +1237,7 @@ function tickPolar() {
         return;
     }
     setPolarAoa(polar.currentAoa);
-    initFluid();
+    resetSolverField();
     polar.settleFrames = 0;
     polar.measureFrames = 0;
     polar.sumCl = 0;
@@ -2500,18 +2506,23 @@ function loop() {
             for (let k = 0; k < ns; k++) gpuStep();
             stepCount += ns;
             if (particlesEnabled) gpuUpdateParticles();
-            // Aerodynamic forces from the GPU field (throttled — readback syncs).
-            if ((forcesEnabled || freeFlightEnabled) && (++gpuForceTick % 3 === 0)) {
+            // Aerodynamic forces from the GPU field. Throttled (readback syncs),
+            // but run every frame while polar/optimizer need a responsive Cl.
+            const needForces = forcesEnabled || freeFlightEnabled || polar.active || optimizer.active;
+            const forceNow = polar.active || optimizer.active || (++gpuForceTick % 3 === 0);
+            if (needForces && forceNow) {
                 const F = gpuComputeForces();
                 const chordGpu = airfoilChord * (GPU_W / simWidth);
                 const q = 0.5 * currentInletVel * currentInletVel;
                 if (q > 1e-6 && chordGpu > 0) {
                     let cl = -F.fy / (q * chordGpu);   // screen-y flip, as on CPU
                     let cd =  F.fx / (q * chordGpu);
-                    if (cl > 10) cl = 10; else if (cl < -10) cl = -10;
-                    if (cd > 10) cd = 10; else if (cd < -10) cd = -10;
-                    Cl = 0.9 * Cl + 0.1 * cl;
-                    Cd = 0.9 * Cd + 0.1 * cd;
+                    if (isFinite(cl) && isFinite(cd)) { // guard: divergent candidate → don't poison Cl
+                        if (cl > 10) cl = 10; else if (cl < -10) cl = -10;
+                        if (cd > 10) cd = 10; else if (cd < -10) cd = -10;
+                        Cl = 0.9 * Cl + 0.1 * cl;
+                        Cd = 0.9 * Cd + 0.1 * cd;
+                    }
                 }
                 // Moment rescaled to CPU-grid units so free-flight inertia tuning carries over.
                 const sc = simWidth / GPU_W;
@@ -2519,7 +2530,9 @@ function loop() {
                 // Pull the field down to sim res so Cp/wake plots have data.
                 if (forcesEnabled) gpuReadbackField();
             }
+            tickOptimizer();
             tickFreeFlight();
+            tickPolar();
             pushHistory();
         } else {
             for(let k=0; k<8; k++) solve();
@@ -2787,7 +2800,7 @@ let GPU_RES_IDX = 1;
 let GPU_W = GPU_RES_LEVELS[GPU_RES_IDX][0], GPU_H = GPU_RES_LEVELS[GPU_RES_IDX][1];
 let gpuEnabled = false;
 const gpu = { ok: false, active: false, gl: null, reason: '' };
-const BUILD_TAG = 'gpu-p4c'; // bump each deploy so cache staleness is visible on-screen
+const BUILD_TAG = 'gpu-p5'; // bump each deploy so cache staleness is visible on-screen
 const GPU_PW = 256, GPU_PH = 128; // particle texture → 32768 tracers
 // The GL canvas renders smooth (image-rendering:auto) vs the CPU canvas's
 // pixelated upscale, so it reads ~0.6 less contrasty. Compensate to match.
@@ -3544,6 +3557,7 @@ function drawGpuFrame(){
     drawCpPlot(ctx,width,height);
     drawWakePlot(ctx,width,height);
   }
+  drawPolarPlot(ctx,width,height); // visible during/after a sweep
   drawColorLegend(ctx,width,height);
   // GPU HUD — shows the live state so render bugs are diagnosable at a glance.
   ctx.textAlign='left';
@@ -3558,7 +3572,7 @@ function drawGpuFrame(){
 // CPU-only features that are inert while the GPU solver runs (phase 1). Grey
 // them out so it's clear they're unavailable rather than silently broken.
 function setGpuFeatureLock(on){
-  const ids=['btn_optimize','btn_polar','btn_audio','btn_mrt','btn_freeslip'];
+  const ids=['btn_audio','btn_mrt','btn_freeslip'];
   ids.forEach(id=>{ const el=document.getElementById(id); if(el) el.disabled=on; });
   const note=document.getElementById('gpu_feature_note');
   if(note) note.style.display = on ? '' : 'none';
