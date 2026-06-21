@@ -329,6 +329,10 @@
             <button id="btn_freeflight">Free Flight</button>
             <button id="btn_optimize">Optimize ↑ Cl</button>
         </div>
+        <div class="btn-row" style="margin-top: 6px;">
+            <button id="btn_polar">Run Polar</button>
+            <button id="btn_audio">Karman tone</button>
+        </div>
 
         <div class="stats" id="simStatus">
             Steps: 0<br>
@@ -399,6 +403,24 @@ let aoaRate = 0;         // degrees per LBM step
 let Mz_smoothed = 0;
 const I_FLIGHT = 2.0e6;  // rotational inertia
 const GAMMA_FLIGHT = 0.003; // viscous damping per LBM step
+
+// Auto-sweep Cl-α polar curve. State machine like the optimizer: per AoA,
+// settle the field, then average Cl/Cd over a measurement window.
+const polar = {
+    active: false,
+    aoaStart: -10,
+    aoaEnd:   25,
+    aoaStep:   2,
+    currentAoa: 0,
+    settleFrames: 0, settleTarget: 70,
+    measureFrames: 0, measureTarget: 35,
+    sumCl: 0, sumCd: 0,
+    data: []  // array of { aoa, cl, cd }
+};
+
+// Strouhal-tone audio: pitch-shift the dominant Cl frequency into the
+// audible range. WebAudio needs a user gesture to start, hence the toggle.
+let audioCtx = null, audioOsc = null, audioGain = null, audioEnabled = false;
 
 // Boussinesq thermal coupling
 let thermalEnabled = false;
@@ -1081,6 +1103,239 @@ function getEquilibrium(rho, u, v, i) {
     return rho * w[i] * (1.0 + cu + 0.5 * cu * cu - u2);
 }
 
+// ============================================================================
+// Polar sweep — auto-ramp AoA across a range, record (α, Cl, Cd).
+// ============================================================================
+function startPolar() {
+    if (polar.active) { stopPolar(); return; }
+    if (geomMode === 'cylinder') return; // AoA meaningless
+    if (optimizer.active) return;        // optimizer owns the AoA channel
+    if (freeFlightEnabled) {
+        // Take direct control from the FSI integrator while sweeping.
+        document.getElementById('btn_freeflight').click();
+    }
+    polar.active = true;
+    polar.currentAoa = polar.aoaStart;
+    polar.settleFrames = 0;
+    polar.measureFrames = 0;
+    polar.sumCl = 0;
+    polar.sumCd = 0;
+    polar.data = [];
+    setPolarAoa(polar.currentAoa);
+    initFluid();
+    const btn = document.getElementById('btn_polar');
+    btn.classList.add('active');
+    btn.innerText = 'Stop';
+    document.getElementById('in_aoa').disabled = true;
+}
+
+function stopPolar() {
+    if (!polar.active) return;
+    polar.active = false;
+    const btn = document.getElementById('btn_polar');
+    btn.classList.remove('active');
+    btn.innerText = 'Run Polar';
+    document.getElementById('in_aoa').disabled = freeFlightEnabled;
+}
+
+function setPolarAoa(deg) {
+    params.aoa = deg;
+    document.getElementById('in_aoa').value = deg;
+    document.getElementById('disp_aoa').innerText = deg + '°';
+    buildGeometry();
+}
+
+function tickPolar() {
+    if (!polar.active) return;
+    if (polar.settleFrames < polar.settleTarget) {
+        polar.settleFrames++;
+        return;
+    }
+    if (polar.measureFrames < polar.measureTarget) {
+        polar.sumCl += Cl;
+        polar.sumCd += Cd;
+        polar.measureFrames++;
+        return;
+    }
+    // Sample is done — record it.
+    polar.data.push({
+        aoa: polar.currentAoa,
+        cl: polar.sumCl / polar.measureTarget,
+        cd: polar.sumCd / polar.measureTarget
+    });
+    polar.currentAoa += polar.aoaStep;
+    if (polar.currentAoa > polar.aoaEnd) {
+        stopPolar();
+        return;
+    }
+    setPolarAoa(polar.currentAoa);
+    initFluid();
+    polar.settleFrames = 0;
+    polar.measureFrames = 0;
+    polar.sumCl = 0;
+    polar.sumCd = 0;
+}
+
+function drawPolarPlot(ctx2d, canvasWidth, canvasHeight) {
+    if (polar.data.length === 0 && !polar.active) return;
+
+    const pw = 240, ph = 140;
+    const px0 = Math.floor((canvasWidth - pw) / 2);
+    const py0 = 32;
+
+    // Background plate
+    ctx2d.fillStyle = 'rgba(0,0,0,0.55)';
+    ctx2d.fillRect(px0 - 10, py0 - 22, pw + 20, ph + 36);
+
+    // Frame
+    ctx2d.strokeStyle = 'rgba(255,255,255,0.25)';
+    ctx2d.lineWidth = 1;
+    ctx2d.strokeRect(px0 + 0.5, py0 + 0.5, pw - 1, ph - 1);
+
+    // Axis ranges
+    const aoaMin = polar.aoaStart, aoaMax = polar.aoaEnd;
+    let clMin = -0.5, clMax = 1.2;
+    for (const p of polar.data) {
+        if (p.cl < clMin) clMin = p.cl;
+        if (p.cl > clMax) clMax = p.cl;
+    }
+    const span = clMax - clMin;
+    clMin -= span * 0.05;
+    clMax += span * 0.05;
+
+    const sx = a  => px0 + (a - aoaMin) / (aoaMax - aoaMin) * pw;
+    const sy = cl => py0 + (clMax - cl) / (clMax - clMin) * ph;
+
+    // α=0 and Cl=0 references
+    ctx2d.strokeStyle = 'rgba(255,255,255,0.18)';
+    if (clMin <= 0 && clMax >= 0) {
+        ctx2d.beginPath();
+        ctx2d.moveTo(px0, sy(0));
+        ctx2d.lineTo(px0 + pw, sy(0));
+        ctx2d.stroke();
+    }
+    if (aoaMin <= 0 && aoaMax >= 0) {
+        ctx2d.beginPath();
+        ctx2d.moveTo(sx(0), py0);
+        ctx2d.lineTo(sx(0), py0 + ph);
+        ctx2d.stroke();
+    }
+
+    // Curve
+    if (polar.data.length >= 2) {
+        ctx2d.strokeStyle = '#4ade80';
+        ctx2d.lineWidth = 1.8;
+        ctx2d.beginPath();
+        for (let i = 0; i < polar.data.length; i++) {
+            const X = sx(polar.data[i].aoa), Y = sy(polar.data[i].cl);
+            if (i === 0) ctx2d.moveTo(X, Y);
+            else ctx2d.lineTo(X, Y);
+        }
+        ctx2d.stroke();
+    }
+    // Sample points
+    ctx2d.fillStyle = '#4ade80';
+    for (const p of polar.data) {
+        ctx2d.beginPath();
+        ctx2d.arc(sx(p.aoa), sy(p.cl), 2.5, 0, 2*Math.PI);
+        ctx2d.fill();
+    }
+    // Live cursor at the currently-sweeping AoA
+    if (polar.active) {
+        ctx2d.strokeStyle = 'rgba(255,255,255,0.45)';
+        ctx2d.setLineDash([3, 3]);
+        ctx2d.beginPath();
+        ctx2d.moveTo(sx(polar.currentAoa), py0);
+        ctx2d.lineTo(sx(polar.currentAoa), py0 + ph);
+        ctx2d.stroke();
+        ctx2d.setLineDash([]);
+    }
+
+    // Title + axis labels
+    ctx2d.fillStyle = '#eaeaea';
+    ctx2d.font = '11px sans-serif';
+    ctx2d.textAlign = 'left';
+    const title = polar.active
+        ? `Cl vs α  (${polar.data.length}/${Math.ceil((polar.aoaEnd-polar.aoaStart)/polar.aoaStep)+1})`
+        : 'Cl vs α  (polar)';
+    ctx2d.fillText(title, px0, py0 - 7);
+    ctx2d.font = '9px monospace';
+    ctx2d.fillStyle = '#bbb';
+    ctx2d.fillText(aoaMin + '°', px0 + 2, py0 + ph + 11);
+    ctx2d.textAlign = 'right';
+    ctx2d.fillText(aoaMax + '°', px0 + pw - 2, py0 + ph + 11);
+    ctx2d.textAlign = 'left';
+    ctx2d.fillText('Cl ' + clMax.toFixed(2), px0 + 3, py0 + 10);
+    ctx2d.fillText('Cl ' + clMin.toFixed(2), px0 + 3, py0 + ph - 3);
+}
+
+// ============================================================================
+// Strouhal-tone audio — DFT the Cl history, peak frequency → audible sine.
+// ============================================================================
+function strouhalPeakHz() {
+    // Returns the dominant frequency in Cl(t) in samples⁻¹. 0 if not converged.
+    if (histCount < 64) return 0;
+    let mean = 0;
+    for (let k = 0; k < histCount; k++) {
+        const idx = (histIdx - histCount + k + HIST_LEN) % HIST_LEN;
+        mean += clHist[idx];
+    }
+    mean /= histCount;
+    let maxPow = 0, peakK = 0;
+    // Scan k=2 (period = N/2 samples) up to k=40, skipping DC and very-low-f.
+    const kMax = Math.min(40, Math.floor(histCount / 4));
+    for (let k = 2; k < kMax; k++) {
+        let re = 0, im = 0;
+        const w0 = 2 * Math.PI * k / histCount;
+        for (let n = 0; n < histCount; n++) {
+            const idx = (histIdx - histCount + n + HIST_LEN) % HIST_LEN;
+            const v = clHist[idx] - mean;
+            re += v * Math.cos(w0 * n);
+            im += v * Math.sin(w0 * n);
+        }
+        const pow = re*re + im*im;
+        if (pow > maxPow) { maxPow = pow; peakK = k; }
+    }
+    return peakK / histCount; // cycles per sample (frame)
+}
+
+function ensureAudio() {
+    if (audioCtx) return;
+    const Ctor = window.AudioContext || window.webkitAudioContext;
+    if (!Ctor) return;
+    audioCtx = new Ctor();
+    audioOsc = audioCtx.createOscillator();
+    audioGain = audioCtx.createGain();
+    audioOsc.type = 'sine';
+    audioOsc.frequency.value = 440;
+    audioGain.gain.value = 0;
+    audioOsc.connect(audioGain).connect(audioCtx.destination);
+    audioOsc.start();
+}
+
+function toggleAudio() {
+    audioEnabled = !audioEnabled;
+    if (audioEnabled) ensureAudio();
+    if (audioGain) {
+        audioGain.gain.setTargetAtTime(audioEnabled ? 0.04 : 0, audioCtx.currentTime, 0.1);
+    }
+}
+
+function updateAudio() {
+    if (!audioEnabled || !audioOsc) return;
+    const fPerSample = strouhalPeakHz(); // cycles per Cl sample
+    if (fPerSample <= 0) {
+        audioGain.gain.setTargetAtTime(0, audioCtx.currentTime, 0.3);
+        return;
+    }
+    // Samples are pushed once per animation frame (~60 Hz). Pitch-shift up
+    // ~×60 so a 1 Hz vortex-shedding cycle lands near A4 (440 Hz).
+    const fHz = fPerSample * 60;       // visible Hz
+    const audioHz = 180 + fHz * 220;   // audible mapping (tuned)
+    audioOsc.frequency.setTargetAtTime(audioHz, audioCtx.currentTime, 0.05);
+    audioGain.gain.setTargetAtTime(0.04, audioCtx.currentTime, 0.2);
+}
+
 function solve() {
     // Ramp inlet velocity
     if(currentInletVel < params.speed) {
@@ -1543,6 +1798,94 @@ function computeCpDistribution() {
     return pts;
 }
 
+// Pick a sampling station ~1 chord behind the wing and plot the streamwise
+// velocity profile u(y)/U∞ across the channel. The velocity defect is the
+// drag (momentum theorem) — a beautiful independent check on the wall-link
+// Cd from the airfoil bounce-back.
+function drawWakePlot(ctx2d, canvasWidth, canvasHeight) {
+    if (airfoilChord < 5) return;
+    const u_inf = Math.max(params.speed, 0.01);
+    // Station: 1 chord downstream of the airfoil's TE — clamped inside domain.
+    const stationX = Math.min(simWidth - 3,
+        Math.max(2, Math.round(airfoilTE.x + airfoilChord)));
+
+    // Sample u(y) at the station; skip barrier cells (channel walls).
+    const samples = [];
+    let xMin = 0, xMax = 1.2;
+    for (let y = 1; y < simHeight - 1; y++) {
+        const i = stationX + y * simWidth;
+        if (barrier[i]) continue;
+        const r = ux[i] / u_inf;
+        samples.push({ y, r });
+        if (r < xMin) xMin = r;
+        if (r > xMax) xMax = r;
+    }
+    if (samples.length < 4) return;
+    xMin -= 0.05; xMax += 0.05;
+
+    const pw = 130, ph = 150;
+    const px0 = 20;
+    // Sit just under the top-left Cp plot so the two diagnostics stack.
+    const py0 = canvasHeight - ph - 90;
+
+    // Background plate
+    ctx2d.fillStyle = 'rgba(0,0,0,0.55)';
+    ctx2d.fillRect(px0 - 10, py0 - 22, pw + 20, ph + 36);
+
+    // Frame
+    ctx2d.strokeStyle = 'rgba(255,255,255,0.25)';
+    ctx2d.lineWidth = 1;
+    ctx2d.strokeRect(px0 + 0.5, py0 + 0.5, pw - 1, ph - 1);
+
+    const sx = u => px0 + (u - xMin) / (xMax - xMin) * pw;
+    const sy = y => py0 + (y / simHeight) * ph;
+
+    // Freestream reference line u/U∞ = 1
+    if (xMin < 1 && xMax > 1) {
+        ctx2d.strokeStyle = 'rgba(255,255,255,0.25)';
+        ctx2d.setLineDash([3, 3]);
+        ctx2d.beginPath();
+        ctx2d.moveTo(sx(1), py0);
+        ctx2d.lineTo(sx(1), py0 + ph);
+        ctx2d.stroke();
+        ctx2d.setLineDash([]);
+    }
+
+    // u(y) curve
+    ctx2d.strokeStyle = '#fbbf24';
+    ctx2d.lineWidth = 1.6;
+    ctx2d.beginPath();
+    for (let i = 0; i < samples.length; i++) {
+        const X = sx(samples[i].r), Y = sy(samples[i].y);
+        if (i === 0) ctx2d.moveTo(X, Y);
+        else ctx2d.lineTo(X, Y);
+    }
+    ctx2d.stroke();
+
+    // Title + labels
+    ctx2d.fillStyle = '#eaeaea';
+    ctx2d.font = '11px sans-serif';
+    ctx2d.textAlign = 'left';
+    ctx2d.fillText('Wake u(y)/U∞', px0, py0 - 7);
+    ctx2d.font = '9px monospace';
+    ctx2d.fillStyle = '#bbb';
+    ctx2d.fillText(xMin.toFixed(1), px0, py0 + ph + 11);
+    ctx2d.textAlign = 'right';
+    ctx2d.fillText(xMax.toFixed(1), px0 + pw, py0 + ph + 11);
+    ctx2d.textAlign = 'left';
+
+    // Mark the sampling station on the main canvas with a faint vertical line.
+    const stationCanvasX = (stationX + 0.5) * (canvasWidth / simWidth);
+    ctx2d.strokeStyle = 'rgba(251, 191, 36, 0.35)';
+    ctx2d.setLineDash([4, 6]);
+    ctx2d.lineWidth = 1;
+    ctx2d.beginPath();
+    ctx2d.moveTo(stationCanvasX, 0);
+    ctx2d.lineTo(stationCanvasX, canvasHeight);
+    ctx2d.stroke();
+    ctx2d.setLineDash([]);
+}
+
 function drawCpPlot(ctx2d, canvasWidth, canvasHeight) {
     if (airfoilChord < 5) return;
     const tick = stepCount;
@@ -1972,7 +2315,12 @@ function draw() {
 
     // 6. Cp(x/c) surface plot — tied to the Forces toggle since they're both
     //    aero diagnostics.
-    if (forcesEnabled) drawCpPlot(ctx, width, height);
+    if (forcesEnabled) {
+        drawCpPlot(ctx, width, height);
+        drawWakePlot(ctx, width, height);
+    }
+    // Polar plot stays visible after a sweep finishes — even when Forces is off.
+    drawPolarPlot(ctx, width, height);
 
     // 7. Color legend — drawn last so it sits on top of everything.
     drawColorLegend(ctx, width, height);
@@ -1998,7 +2346,9 @@ function loop() {
         if (particlesEnabled) advectParticles();
         tickOptimizer();
         tickFreeFlight();
+        tickPolar();
         pushHistory();
+        updateAudio();
     }
     draw();
     drawSparkline();
@@ -2308,6 +2658,16 @@ document.getElementById('btn_freeflight').addEventListener('click', function() {
         aoaRate = 0;
         Mz_smoothed = 0;
     }
+});
+
+document.getElementById('btn_polar').addEventListener('click', function() {
+    if (polar.active) stopPolar();
+    else startPolar();
+});
+
+document.getElementById('btn_audio').addEventListener('click', function() {
+    toggleAudio();
+    this.classList.toggle('active', audioEnabled);
 });
 
 document.getElementById('btn_thermal').addEventListener('click', function() {
