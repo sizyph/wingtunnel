@@ -261,7 +261,7 @@
 
     <!-- UI Overlay -->
     <div id="ui-layer">
-        <h1>Wingtunnel<span class="subtitle">interactive LBM airfoil sim</span></h1>
+        <h1>Wingtunnel<span class="subtitle">interactive LBM airfoil sim · <span id="build_tag">gpu-p2b</span></span></h1>
 
         <h2 class="section">Flow</h2>
         <div class="control-group">
@@ -2759,6 +2759,7 @@ let GPU_RES_IDX = 1;
 let GPU_W = GPU_RES_LEVELS[GPU_RES_IDX][0], GPU_H = GPU_RES_LEVELS[GPU_RES_IDX][1];
 let gpuEnabled = false;
 const gpu = { ok: false, active: false, gl: null, reason: '' };
+const BUILD_TAG = 'gpu-p2c'; // bump each deploy so cache staleness is visible on-screen
 // Substeps auto-scale inversely with cell count, holding per-frame work roughly
 // constant so the highest resolutions stay interactive.
 function gpuSubsteps(){ return Math.max(2, Math.round(6*(1024*512)/(GPU_W*GPU_H))); }
@@ -3152,8 +3153,12 @@ function gpuStepThermal(){
 
 function gpuRender(){
   const gl=gpu.gl;
-  // Match drawing buffer to display size for crisp output.
-  const dispW=glCanvas.clientWidth, dispH=glCanvas.clientHeight;
+  // Match drawing buffer to DEVICE pixels so the high-res field is actually
+  // crisp on Retina displays (CSS-resolution backing would be browser-upscaled
+  // and look no sharper than the CPU canvas).
+  const dpr=Math.min(window.devicePixelRatio||1, 2);
+  const dispW=Math.max(1,Math.round(glCanvas.clientWidth*dpr));
+  const dispH=Math.max(1,Math.round(glCanvas.clientHeight*dpr));
   if(glCanvas.width!==dispW) glCanvas.width=dispW;
   if(glCanvas.height!==dispH) glCanvas.height=dispH;
   gl.useProgram(gpu.progRender);
@@ -3192,11 +3197,14 @@ function drawGpuFrame(){
     for(const p of extraPolygons) strokePoly(p,"#c8b8a8");
   }
   drawColorLegend(ctx,width,height);
-  // GPU badge
-  ctx.fillStyle='rgba(0,210,255,0.9)';
-  ctx.font='bold 12px monospace';
+  // GPU HUD — shows the live state so render bugs are diagnosable at a glance.
   ctx.textAlign='left';
-  ctx.fillText('GPU '+GPU_W+'×'+GPU_H+' · '+gpuSubsteps()+' substeps (experimental)',20,22);
+  ctx.font='bold 12px monospace';
+  ctx.fillStyle='rgba(0,210,255,0.95)';
+  ctx.fillText('GPU '+GPU_W+'×'+GPU_H+' · '+gpuSubsteps()+' substeps · '+BUILD_TAG,20,22);
+  ctx.font='11px monospace';
+  ctx.fillStyle='rgba(255,255,255,0.85)';
+  ctx.fillText('view='+viewMode+'   thermal='+(thermalEnabled?'ON':'off'),20,38);
 }
 
 // CPU-only features that are inert while the GPU solver runs (phase 1). Grey
@@ -3247,6 +3255,7 @@ buildGeometry();
 initFluid();
 initParticles();
 glCanvas.style.display='none';
+{ const bt=document.getElementById('build_tag'); if(bt) bt.innerText=BUILD_TAG; }
 suppressHashWrite = false; // allow hash writes from now on
 
 // Listeners
