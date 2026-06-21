@@ -1920,15 +1920,18 @@ function computeCpDistribution() {
     maxX = Math.min(simWidth - 2, Math.ceil(maxX) + 1);
     minY = Math.max(1, Math.floor(minY) - 1);
     maxY = Math.min(simHeight - 2, Math.ceil(maxY) + 1);
+    // In GPU mode classify cells from the field-consistent mask (the CPU barrier
+    // is rasterized at a different resolution than the GPU field).
+    const mask = (gpu.active && gpuFieldMask) ? gpuFieldMask : barrier;
     for (let y = minY; y <= maxY; y++) {
         for (let x = minX; x <= maxX; x++) {
             const i = x + y * simWidth;
-            if (barrier[i] !== 2) continue;
+            if (mask[i] !== 2) continue;
             let sumRho = 0, count = 0;
             // Only cardinal neighbours — they're the cleanest pressure samples.
             const neigh = [i-1, i+1, i-simWidth, i+simWidth];
             for (let n = 0; n < 4; n++) {
-                if (barrier[neigh[n]] === 0) { sumRho += rho[neigh[n]]; count++; }
+                if (mask[neigh[n]] === 0) { sumRho += rho[neigh[n]]; count++; }
             }
             if (count === 0) continue;
             const cp = (sumRho / count / 3.0 - p_inf) / q_inf;
@@ -1953,11 +1956,12 @@ function drawWakePlot(ctx2d, canvasWidth, canvasHeight) {
         Math.max(2, Math.round(airfoilTE.x + airfoilChord)));
 
     // Sample u(y) at the station; skip barrier cells (channel walls).
+    const mask = (gpu.active && gpuFieldMask) ? gpuFieldMask : barrier;
     const samples = [];
     let xMin = 0, xMax = 1.2;
     for (let y = 1; y < simHeight - 1; y++) {
         const i = stationX + y * simWidth;
-        if (barrier[i]) continue;
+        if (mask[i]) continue;
         const r = ux[i] / u_inf;
         samples.push({ y, r });
         if (r < xMin) xMin = r;
@@ -2046,8 +2050,9 @@ function drawCpPlot(ctx2d, canvasWidth, canvasHeight) {
 
     const pw = 240, ph = 130;
     // Top-left — keeps clear of the right-side UI panel and the bottom legend.
+    // Pushed down in GPU mode so it sits below the two-line GPU HUD.
     const px0 = 20;
-    const py0 = 32;
+    const py0 = gpu.active ? 78 : 32;
 
     // Background plate
     ctx2d.fillStyle = 'rgba(0, 0, 0, 0.55)';
@@ -2782,12 +2787,13 @@ let GPU_RES_IDX = 1;
 let GPU_W = GPU_RES_LEVELS[GPU_RES_IDX][0], GPU_H = GPU_RES_LEVELS[GPU_RES_IDX][1];
 let gpuEnabled = false;
 const gpu = { ok: false, active: false, gl: null, reason: '' };
-const BUILD_TAG = 'gpu-p4b'; // bump each deploy so cache staleness is visible on-screen
+const BUILD_TAG = 'gpu-p4c'; // bump each deploy so cache staleness is visible on-screen
 const GPU_PW = 256, GPU_PH = 128; // particle texture → 32768 tracers
 // The GL canvas renders smooth (image-rendering:auto) vs the CPU canvas's
 // pixelated upscale, so it reads ~0.6 less contrasty. Compensate to match.
 const GPU_CONTRAST_OFFSET = 0.6;
 let gpuForceTick = 0; // throttles the (sync) force readback
+let gpuFieldMask = null; // sim-res airfoil/wall mask sampled from the GPU field, for Cp/wake
 // Substeps auto-scale inversely with cell count, holding per-frame work roughly
 // constant so the highest resolutions stay interactive.
 function gpuSubsteps(){ return Math.max(2, Math.round(6*(1024*512)/(GPU_W*GPU_H))); }
@@ -3074,10 +3080,14 @@ void main(){
 // arrays) work unchanged in GPU mode.
 const GPU_DOWNSAMPLE_FRAG = `#version 300 es
 precision highp float;
-uniform sampler2D u_f2;
+uniform sampler2D u_f2,u_mask;
 in vec2 v_uv;
 out vec4 frag;
-void main(){ frag = texture(u_f2, v_uv); }`;
+void main(){
+  vec4 d=texture(u_f2,v_uv);          // (f8,rho,ux,uy)
+  float mk=texture(u_mask,v_uv).r;    // 0 fluid · 1 wall · 2 airfoil
+  frag=vec4(d.y, d.z, d.w, mk);       // rho,ux,uy,mask — consistent sample
+}`;
 
 // Parallel-reduction: each output texel sums the corresponding 2×2 source block.
 const GPU_REDUCE_FRAG = `#version 300 es
@@ -3450,12 +3460,21 @@ function gpuReadbackField(){
   gl.drawBuffers([gl.COLOR_ATTACHMENT0]);
   gl.viewport(0,0,simWidth,simHeight);
   gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,gpu.read.t2);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D,gpu.maskTex);
   gl.uniform1i(gl.getUniformLocation(gpu.progDownsample,'u_f2'),0);
+  gl.uniform1i(gl.getUniformLocation(gpu.progDownsample,'u_mask'),1);
   gl.drawArrays(gl.TRIANGLES,0,6);
   if(!gpu.dsBuf) gpu.dsBuf=new Float32Array(simWidth*simHeight*4);
   gl.readPixels(0,0,simWidth,simHeight,gl.RGBA,gl.FLOAT,gpu.dsBuf);
   const b=gpu.dsBuf, n=simWidth*simHeight;
-  for(let i=0;i<n;i++){ rho[i]=b[i*4+1]; ux[i]=b[i*4+2]; uy[i]=b[i*4+3]; }
+  if(!gpuFieldMask) gpuFieldMask=new Uint8Array(n);
+  // rho,ux,uy + a sim-res mask consistent with this same field sample, so the
+  // Cp/wake plots classify airfoil/fluid/wall the way the GPU field actually is.
+  for(let i=0;i<n;i++){
+    rho[i]=b[i*4]; ux[i]=b[i*4+1]; uy[i]=b[i*4+2];
+    const mk=b[i*4+3];
+    gpuFieldMask[i] = mk>1.5 ? 2 : (mk>0.5 ? 1 : 0);
+  }
 }
 
 function gpuRender(){
