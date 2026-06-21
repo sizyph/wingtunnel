@@ -364,8 +364,8 @@
             </div>
         </div>
         <div id="gpu_feature_note" style="display:none;font-size:0.62rem;color:var(--accent);opacity:0.8;margin-top:6px;">
-            GPU mode runs speed · vorticity · pressure · temperature. Forces · Cp ·
-            particles · optimizer · MRT are paused (CPU-only — ported in later phases).
+            GPU mode runs speed · vorticity · pressure · temperature · particles.
+            Forces · Cp · optimizer · MRT are paused (CPU-only — ported in later phases).
         </div>
 
         <div class="stats" id="simStatus">
@@ -2493,6 +2493,7 @@ function loop() {
             const ns = gpuSubsteps();
             for (let k = 0; k < ns; k++) gpuStep();
             stepCount += ns;
+            if (particlesEnabled) gpuUpdateParticles();
         } else {
             for(let k=0; k<8; k++) solve();
             if (!checkStability()) {
@@ -2759,13 +2760,14 @@ let GPU_RES_IDX = 1;
 let GPU_W = GPU_RES_LEVELS[GPU_RES_IDX][0], GPU_H = GPU_RES_LEVELS[GPU_RES_IDX][1];
 let gpuEnabled = false;
 const gpu = { ok: false, active: false, gl: null, reason: '' };
-const BUILD_TAG = 'gpu-p2c'; // bump each deploy so cache staleness is visible on-screen
+const BUILD_TAG = 'gpu-p3'; // bump each deploy so cache staleness is visible on-screen
+const GPU_PW = 256, GPU_PH = 128; // particle texture → 32768 tracers
 // Substeps auto-scale inversely with cell count, holding per-frame work roughly
 // constant so the highest resolutions stay interactive.
 function gpuSubsteps(){ return Math.max(2, Math.round(6*(1024*512)/(GPU_W*GPU_H))); }
 
 const GPU_VERT = `#version 300 es
-in vec2 a_pos;
+layout(location=0) in vec2 a_pos;
 out vec2 v_uv;
 void main(){ v_uv = a_pos*0.5+0.5; gl_Position = vec4(a_pos,0.0,1.0); }`;
 
@@ -2950,6 +2952,61 @@ void main(){
   frag=vec4(clamp(nT,0.0,1.05),0.0,0.0,0.0);
 }`;
 
+// GPU-native particle tracers. Positions live in a texture (normalized domain
+// coords in .xy, age in .z), advected by the velocity field on the GPU — no CPU
+// readback, so they align with the fluid automatically. y=0 is screen-top, the
+// same convention as the field, so points sit on the flow they're following.
+const GPU_PUPDATE_FRAG = `#version 300 es
+precision highp float;
+uniform sampler2D u_pos,u_vel,u_mask;
+uniform vec2 u_dims;
+uniform float u_dt,u_seed;
+out vec4 frag;
+float hash(vec2 p){ return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453); }
+void main(){
+  ivec2 t=ivec2(gl_FragCoord.xy);
+  vec4 P=texelFetch(u_pos,t,0);
+  vec2 pos=P.xy; float age=P.z;
+  vec2 vel=texture(u_vel,pos).zw;     // (ux,uy)
+  pos += vel*u_dt/u_dims;             // cells→normalized displacement
+  age += 1.0;
+  bool oob = pos.x<0.0||pos.x>1.0||pos.y<0.0||pos.y>1.0;
+  float mk = oob?0.0:texture(u_mask,pos).r;
+  if(oob || mk>0.5 || age>600.0){
+    float h1=hash(vec2(gl_FragCoord.xy)+u_seed);
+    float h2=hash(vec2(gl_FragCoord.yx)*1.7+vec2(u_seed*0.31));
+    pos=vec2(0.01+0.03*h1, 0.02+0.96*h2); // respawn near the inlet
+    age=0.0;
+  }
+  frag=vec4(pos,age,1.0);
+}`;
+
+const GPU_PRENDER_VERT = `#version 300 es
+uniform sampler2D u_pos;
+uniform float u_pw;
+out float v_age;
+void main(){
+  int id=gl_VertexID;
+  int w=int(u_pw);
+  ivec2 t=ivec2(id - (id/w)*w, id/w);
+  vec4 P=texelFetch(u_pos,t,0);
+  v_age=P.z;
+  // pos.y=0 is screen-top → clip-space +1, matching the fluid render.
+  gl_Position=vec4(P.x*2.0-1.0, 1.0-P.y*2.0, 0.0, 1.0);
+  gl_PointSize=3.0;
+}`;
+
+const GPU_PRENDER_FRAG = `#version 300 es
+precision highp float;
+in float v_age;
+out vec4 frag;
+void main(){
+  vec2 d=gl_PointCoord-0.5;
+  if(dot(d,d)>0.25) discard;          // round dot
+  float a=clamp(v_age/20.0,0.0,1.0)*clamp((600.0-v_age)/120.0,0.0,1.0);
+  frag=vec4(1.0,1.0,1.0,0.75*a);
+}`;
+
 function gpuCompile(gl, type, src){
   const s=gl.createShader(type); gl.shaderSource(s,src); gl.compileShader(s);
   if(!gl.getShaderParameter(s,gl.COMPILE_STATUS)){
@@ -3055,6 +3112,12 @@ function gpuInit(){
   gpu.progThermal=gpuProgram(gl,GPU_VERT,GPU_THERMAL_FRAG);
   if(!gpu.progThermal){ gpu.reason='thermal shader build failed (see console)'; return false; }
   gpu.Tread=gpuMakeT(gl); gpu.Twrite=gpuMakeT(gl);
+  // GPU-native particle programs (update over a position texture, point render).
+  gpu.progPUpdate=gpuProgram(gl,GPU_VERT,GPU_PUPDATE_FRAG);
+  gpu.progPRender=gpuProgram(gl,GPU_PRENDER_VERT,GPU_PRENDER_FRAG);
+  if(!gpu.progPUpdate||!gpu.progPRender){ gpu.reason='particle shader build failed (see console)'; return false; }
+  gpu.pvao=gl.createVertexArray(); // attribute-less VAO for gl_VertexID point draws
+  gpu.posRead=null; gpu.posWrite=null;
   gpu.ok=true;
   gpuUploadMask();
   console.log('[GPU] WebGL2 LBM ready — '+GPU_W+'×'+GPU_H+', '+gpuSubsteps()+' substeps/frame');
@@ -3151,6 +3214,69 @@ function gpuStepThermal(){
   const t=gpu.Tread; gpu.Tread=gpu.Twrite; gpu.Twrite=t; // swap
 }
 
+function gpuMakePosTex(gl,data){
+  const tex=gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D,tex);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+  gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA32F,GPU_PW,GPU_PH,0,gl.RGBA,gl.FLOAT,data);
+  const fbo=gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER,fbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,tex,0);
+  return {tex,fbo};
+}
+function gpuInitParticles(){
+  if(!gpu.ok) return;
+  const gl=gpu.gl, n=GPU_PW*GPU_PH;
+  const data=new Float32Array(n*4);
+  for(let i=0;i<n;i++){
+    data[i*4]=0.01+0.38*Math.random();  // x near inlet half
+    data[i*4+1]=Math.random();          // y across channel
+    data[i*4+2]=Math.random()*400;      // staggered ages
+    data[i*4+3]=1;
+  }
+  gpuDeleteT(gpu.posA); gpuDeleteT(gpu.posB);
+  gpu.posA=gpuMakePosTex(gl,data);
+  gpu.posB=gpuMakePosTex(gl,new Float32Array(n*4));
+  gpu.posRead=gpu.posA; gpu.posWrite=gpu.posB;
+}
+function gpuUpdateParticles(){
+  if(!gpu.posRead) gpuInitParticles();
+  const gl=gpu.gl;
+  gl.useProgram(gpu.progPUpdate);
+  gl.bindVertexArray(gpu.vao);
+  gl.viewport(0,0,GPU_PW,GPU_PH);
+  gl.bindFramebuffer(gl.FRAMEBUFFER,gpu.posWrite.fbo);
+  gl.drawBuffers([gl.COLOR_ATTACHMENT0]);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,gpu.posRead.tex);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D,gpu.read.t2);
+  gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D,gpu.maskTex);
+  gl.uniform1i(gl.getUniformLocation(gpu.progPUpdate,'u_pos'),0);
+  gl.uniform1i(gl.getUniformLocation(gpu.progPUpdate,'u_vel'),1);
+  gl.uniform1i(gl.getUniformLocation(gpu.progPUpdate,'u_mask'),2);
+  gl.uniform2f(gl.getUniformLocation(gpu.progPUpdate,'u_dims'),GPU_W,GPU_H);
+  gl.uniform1f(gl.getUniformLocation(gpu.progPUpdate,'u_dt'),gpuSubsteps());
+  gl.uniform1f(gl.getUniformLocation(gpu.progPUpdate,'u_seed'),(stepCount%9973)*0.13);
+  gl.drawArrays(gl.TRIANGLES,0,6);
+  const t=gpu.posRead; gpu.posRead=gpu.posWrite; gpu.posWrite=t;
+}
+function gpuRenderParticles(){
+  if(!gpu.posRead) return;
+  const gl=gpu.gl;
+  gl.useProgram(gpu.progPRender);
+  gl.bindVertexArray(gpu.pvao);
+  gl.bindFramebuffer(gl.FRAMEBUFFER,null);
+  gl.viewport(0,0,glCanvas.width,glCanvas.height);
+  gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,gpu.posRead.tex);
+  gl.uniform1i(gl.getUniformLocation(gpu.progPRender,'u_pos'),0);
+  gl.uniform1f(gl.getUniformLocation(gpu.progPRender,'u_pw'),GPU_PW);
+  gl.drawArrays(gl.POINTS,0,GPU_PW*GPU_PH);
+  gl.disable(gl.BLEND);
+}
+
 function gpuRender(){
   const gl=gpu.gl;
   // Match drawing buffer to DEVICE pixels so the high-res field is actually
@@ -3182,6 +3308,7 @@ function gpuRender(){
 // 2D overlay on top of the GPU canvas: airfoil outline + legend + badge.
 function drawGpuFrame(){
   gpuRender();
+  if(particlesEnabled) gpuRenderParticles(); // points on the GL canvas, under the 2D overlay
   const width = canvas.width = canvas.clientWidth;
   const height = canvas.height = canvas.clientHeight;
   ctx.clearRect(0,0,width,height); // transparent — GL fluid shows through
@@ -3210,7 +3337,7 @@ function drawGpuFrame(){
 // CPU-only features that are inert while the GPU solver runs (phase 1). Grey
 // them out so it's clear they're unavailable rather than silently broken.
 function setGpuFeatureLock(on){
-  const ids=['btn_particles','btn_forces','btn_optimize',
+  const ids=['btn_forces','btn_optimize',
              'btn_freeflight','btn_polar','btn_audio','btn_mrt','btn_freeslip'];
   ids.forEach(id=>{ const el=document.getElementById(id); if(el) el.disabled=on; });
   const note=document.getElementById('gpu_feature_note');
@@ -3233,6 +3360,7 @@ function setGpuEnabled(on){
     }
     gpuUploadMask();
     gpuResetField();
+    if(particlesEnabled) gpuInitParticles();
     gpu.active=true; gpuEnabled=true;
     glCanvas.style.display='block';
     document.getElementById('btn_gpu').classList.add('active');
@@ -3307,6 +3435,7 @@ document.getElementById('btn_particles').addEventListener('click', function() {
     particlesEnabled = !particlesEnabled;
     this.classList.toggle('active', particlesEnabled);
     if (particlesEnabled && particles.length === 0) initParticles();
+    if (particlesEnabled && gpu.active) gpuInitParticles(); // fresh seed on the GPU
 });
 
 document.getElementById('btn_forces').addEventListener('click', function() {
