@@ -316,6 +316,9 @@
             <button id="btn_particles">Particles</button>
             <button id="btn_forces">Forces</button>
         </div>
+        <div class="btn-row" style="margin-top: 6px;">
+            <button id="btn_thermal">Heated wing (Boussinesq)</button>
+        </div>
 
         <h2 class="section">Simulation</h2>
         <div class="btn-row">
@@ -338,7 +341,8 @@
         <div class="hint">
             Drag the wing to rotate · drag the flap to deflect it.<br>
             <kbd>space</kbd> pause · <kbd>v</kbd> view · <kbd>p</kbd> particles<br>
-            <kbd>f</kbd> forces · <kbd>o</kbd> optimize · <kbd>g</kbd> free flight · <kbd>r</kbd> reset
+            <kbd>f</kbd> forces · <kbd>o</kbd> optimize · <kbd>g</kbd> free flight<br>
+            <kbd>t</kbd> heated wing · <kbd>r</kbd> reset
         </div>
     </div>
 
@@ -395,6 +399,15 @@ let aoaRate = 0;         // degrees per LBM step
 let Mz_smoothed = 0;
 const I_FLIGHT = 2.0e6;  // rotational inertia
 const GAMMA_FLIGHT = 0.003; // viscous damping per LBM step
+
+// Boussinesq thermal coupling
+let thermalEnabled = false;
+let T = new Float32Array(N);      // temperature field
+let T_new = new Float32Array(N);  // double buffer for advection-diffusion
+const T_REF = 0.0;                // ambient / inlet / channel-wall temperature
+const T_WING = 1.0;               // heated airfoil
+const T_DIFFUSIVITY = 0.012;      // α — Prandtl number ν/α ≈ 1.7 at defaults
+const G_BUOYANCY = 6e-5;          // g·β — tuned for a visible plume at default flow
 let geomMode = 'naca';   // 'naca' | 'joukowski' | 'cylinder'
 let nacaCode = '2412';
 let flapEnabled = false;         // adds a rear flap to the main NACA element
@@ -476,9 +489,45 @@ function initFluid() {
             f0[i*9 + k] = w[k];
             f1[i*9 + k] = w[k];
         }
+        T[i] = T_REF;
+        T_new[i] = T_REF;
     }
     currentInletVel = 0.0;
     stepCount = 0;
+}
+
+// Boussinesq temperature update: ∂T/∂t + u·∇T = α∇²T, explicit Euler with
+// upwind advection and central diffusion. Wing acts as a hot Dirichlet
+// boundary (T=T_WING); channel walls and inlet pin to T_REF; outlet is
+// zero-gradient. Called once per LBM step inside solve().
+function stepThermal() {
+    if (!thermalEnabled) return;
+    const W = simWidth;
+    for (let y = 1; y < simHeight - 1; y++) {
+        for (let x = 1; x < W - 1; x++) {
+            const i = x + y * W;
+            const b = barrier[i];
+            if (b === 1) { T_new[i] = T_REF; continue; }
+            if (b === 2) { T_new[i] = T_WING; continue; }
+            const u = ux[i], v = uy[i];
+            // Upwind advection
+            const dTdx = u > 0 ? (T[i] - T[i-1]) : (T[i+1] - T[i]);
+            const dTdy = v > 0 ? (T[i] - T[i-W]) : (T[i+W] - T[i]);
+            // Central-difference Laplacian
+            const lapT = T[i+1] + T[i-1] + T[i+W] + T[i-W] - 4*T[i];
+            let next = T[i] - u*dTdx - v*dTdy + T_DIFFUSIVITY * lapT;
+            if (next < 0) next = 0;
+            if (next > T_WING * 1.05) next = T_WING * 1.05;
+            T_new[i] = next;
+        }
+    }
+    // West (cold inlet) and east (zero-gradient outlet)
+    for (let y = 1; y < simHeight - 1; y++) {
+        T_new[y * W] = T_REF;
+        T_new[(W - 1) + y * W] = T_new[(W - 2) + y * W];
+    }
+    // Swap buffers
+    const tmp = T; T = T_new; T_new = tmp;
 }
 
 // Parse a NACA 4-digit designator (e.g. "2412"). Returns null on invalid input.
@@ -1090,35 +1139,45 @@ function solve() {
             u /= r;
             v /= r;
 
-            // Store for viz
+            // Boussinesq buoyancy body force (vertical only, screen-y is down,
+            // so "up" buoyancy on a hot cell is a negative Fy).
+            const Fx_body = 0;
+            const Fy_body = thermalEnabled ? -G_BUOYANCY * (T[i] - T_REF) : 0;
+            // Guo's scheme: "real" macroscopic velocity = u_bare + 0.5·F/ρ.
+            const u_real = u + 0.5 * Fx_body / r;
+            const v_real = v + 0.5 * Fy_body / r;
+
+            // Store for viz (use Guo-corrected velocity)
             rho[i] = r;
-            ux[i] = u;
-            uy[i] = v;
+            ux[i] = u_real;
+            uy[i] = v_real;
 
             // 2. LES Turbulence Calculation (Smagorinsky)
-            // Calculate Non-Equilibrium Strain Tensor
             let Qxx = 0, Qxy = 0, Qyy = 0;
             for(let k=0; k<9; k++) {
-                const feq = getEquilibrium(r, u, v, k);
+                const feq = getEquilibrium(r, u_real, v_real, k);
                 const fneq = f0[offset+k] - feq;
                 Qxx += ex[k] * ex[k] * fneq;
                 Qxy += ex[k] * ey[k] * fneq;
                 Qyy += ey[k] * ey[k] * fneq;
             }
-            
-            // Strain magnitude
             const Pi = Math.sqrt(Qxx*Qxx + 2*Qxy*Qxy + Qyy*Qyy);
-            // Eddy viscosity addition
             const C = params.smagorinsky;
-            // Effective Tau logic
             const tau_add = 0.5 * (Math.sqrt(tau_0*tau_0 + 18.0 * C*C * Pi / r) - tau_0);
             const omega = 1.0 / (tau_0 + tau_add);
 
-            // 3. Collision
+            // 3. Collision (BGK) + Guo forcing term for buoyancy
+            const guoCoef = 1.0 - 0.5 * omega;
+            const uDotF = u_real * Fx_body + v_real * Fy_body;
             for (let k = 0; k < 9; k++) {
-                const feq = getEquilibrium(r, u, v, k);
-                // TRT or BGK collision
-                f0[offset+k] = f0[offset+k] * (1.0 - omega) + feq * omega;
+                const feq = getEquilibrium(r, u_real, v_real, k);
+                let fpost = f0[offset+k] * (1.0 - omega) + feq * omega;
+                if (thermalEnabled) {
+                    const eDotU = ex[k] * u_real + ey[k] * v_real;
+                    const eDotF = ex[k] * Fx_body + ey[k] * Fy_body;
+                    fpost += guoCoef * w[k] * (3.0 * eDotF + 9.0 * eDotU * eDotF - 3.0 * uDotF);
+                }
+                f0[offset+k] = fpost;
             }
         }
     }
@@ -1198,6 +1257,10 @@ function solve() {
 
     // Swap
     let temp = f0; f0 = f1; f1 = temp;
+
+    // Advect-diffuse temperature (Boussinesq scalar). Has to come AFTER the
+    // velocity field is finalised for this step.
+    stepThermal();
     stepCount++;
 
     // Aerodynamic coefficients. Screen y is flipped, so lift (physical up) = -Fy.
@@ -1232,6 +1295,14 @@ function colorMap(t) {
 
     // Adjust for dark background (make it vibrant)
     return [Math.floor(r*255), Math.floor(g*255), Math.floor(b*255)];
+}
+
+// "Hot" colormap: black → dark red → orange → yellow → white. Good for T.
+function hotColor(t, out) {
+    if (t < 0) t = 0; else if (t > 1) t = 1;
+    out[0] = Math.min(255, t * 510) | 0;             // 0 → 255 by t=0.5
+    out[1] = Math.max(0, Math.min(255, (t - 0.33) * 510)) | 0; // 0 → 255 by t≈0.83
+    out[2] = Math.max(0, Math.min(255, (t - 0.66) * 750)) | 0; // 0 → 255 by t=1
 }
 
 // Diverging colormap (RdBu-like) for signed scalars such as vorticity.
@@ -1281,12 +1352,18 @@ function drawColorLegend(ctx2d, canvasWidth, canvasHeight) {
         leftLabel  = '−' + cpMax.toFixed(1) + ' (suction)';
         midLabel   = '0';
         rightLabel = '+' + cpMax.toFixed(1) + ' (comp.)';
-    } else { // 'noise'
+    } else if (viewMode === 'noise') {
         title = 'Lighthill source  ∂²Tij/∂xi∂xj  (log)';
         diverging = true;
         leftLabel  = 'sink';
         midLabel   = 'quiet';
         rightLabel = 'source';
+    } else { // 'temperature'
+        title = 'Temperature T  (Boussinesq)';
+        diverging = false;
+        leftLabel  = 'cold (T∞)';
+        midLabel   = '';
+        rightLabel = 'hot (wing)';
     }
 
     // Background plate for legibility on top of the colored fluid field
@@ -1300,7 +1377,10 @@ function drawColorLegend(ctx2d, canvasWidth, canvasHeight) {
     for (let i = 0; i <= steps; i++) {
         const t = i / steps;
         let r, g, b;
-        if (diverging) {
+        if (viewMode === 'temperature') {
+            hotColor(t, tmp);
+            r = tmp[0]; g = tmp[1]; b = tmp[2];
+        } else if (diverging) {
             divergingColor(t * 2 - 1, tmp);
             r = tmp[0]; g = tmp[1]; b = tmp[2];
         } else {
@@ -1603,6 +1683,7 @@ function encodeStateToHash() {
     qs.set('contrast', params.contrast.toFixed(1));
     qs.set('view',     viewMode);
     if (freeFlightEnabled) qs.set('free', '1');
+    if (thermalEnabled) qs.set('thermal', '1');
     try {
         history.replaceState(null, '', '#' + qs.toString());
     } catch (e) { /* SecurityError in some sandboxed embeds — silently skip */ }
@@ -1643,8 +1724,9 @@ function decodeHashToState() {
     params.viscosity = num('visc',  0.005, 0.08, params.viscosity);
     params.contrast  = num('contrast', 0.5, 3.0, params.contrast);
     const v = qs.get('view');
-    if (v === 'speed' || v === 'vorticity' || v === 'pressure' || v === 'noise') viewMode = v;
+    if (v === 'speed' || v === 'vorticity' || v === 'pressure' || v === 'noise' || v === 'temperature') viewMode = v;
     if (qs.get('free') === '1') freeFlightEnabled = true;
+    if (qs.get('thermal') === '1') thermalEnabled = true;
 }
 
 // Push current state values into every UI element. Used after decoding the
@@ -1676,6 +1758,7 @@ function syncUIFromState() {
     document.getElementById('btn_freeflight').classList.toggle('active', freeFlightEnabled);
     document.getElementById('in_aoa').disabled = freeFlightEnabled;
     if (freeFlightEnabled) { aoaContinuous = params.aoa; aoaRate = 0; }
+    document.getElementById('btn_thermal').classList.toggle('active', thermalEnabled);
     const bv = document.getElementById('btn_view');
     bv.innerText = viewMode.charAt(0).toUpperCase() + viewMode.slice(1);
     bv.classList.toggle('active', viewMode !== 'speed');
@@ -1761,6 +1844,23 @@ function draw() {
                 px[i*4+2] = tmp[2];
                 px[i*4+3] = 255;
             }
+        }
+    } else if (viewMode === 'temperature') {
+        // Heat plume view — hot colormap from T_REF (black) to T_WING (white).
+        const tmp = [0, 0, 0];
+        const span = Math.max(1e-3, T_WING - T_REF);
+        for (let i = 0; i < N; i++) {
+            if (barrier[i]) {
+                // The wing itself glows at the boundary; tint slightly red.
+                px[i*4] = 180; px[i*4+1] = 60; px[i*4+2] = 40; px[i*4+3] = 255;
+                continue;
+            }
+            const t = (T[i] - T_REF) / span * params.contrast;
+            hotColor(t, tmp);
+            px[i*4]   = tmp[0];
+            px[i*4+1] = tmp[1];
+            px[i*4+2] = tmp[2];
+            px[i*4+3] = 255;
         }
     } else {
         for (let i = 0; i < N; i++) {
@@ -2117,6 +2217,7 @@ document.addEventListener('keydown', (e) => {
         'f':       'btn_forces',
         'o':       'btn_optimize',
         'g':       'btn_freeflight',
+        't':       'btn_thermal',
         'r':       'btn_reset'
     };
     const id = map[k];
@@ -2169,11 +2270,12 @@ document.getElementById('btn_pause').addEventListener('click', function() {
 });
 
 document.getElementById('btn_view').addEventListener('click', function() {
-    // Cycle speed -> vorticity -> pressure -> noise -> speed. Button label
-    // shows the CURRENT mode so it stays in lockstep with the legend.
+    // Cycle speed → vorticity → pressure → noise → temperature → speed.
+    // Button label shows the CURRENT mode (matches the bottom-left legend).
     if (viewMode === 'speed') viewMode = 'vorticity';
     else if (viewMode === 'vorticity') viewMode = 'pressure';
     else if (viewMode === 'pressure') viewMode = 'noise';
+    else if (viewMode === 'noise') viewMode = 'temperature';
     else viewMode = 'speed';
     this.innerText = viewMode.charAt(0).toUpperCase() + viewMode.slice(1);
     this.classList.toggle('active', viewMode !== 'speed');
@@ -2205,6 +2307,20 @@ document.getElementById('btn_freeflight').addEventListener('click', function() {
         aoaContinuous = params.aoa;
         aoaRate = 0;
         Mz_smoothed = 0;
+    }
+});
+
+document.getElementById('btn_thermal').addEventListener('click', function() {
+    thermalEnabled = !thermalEnabled;
+    this.classList.toggle('active', thermalEnabled);
+    if (thermalEnabled) {
+        // Re-zero T so the field starts clean and the plume develops visibly.
+        for (let i = 0; i < N; i++) { T[i] = T_REF; T_new[i] = T_REF; }
+        // Jump to Temperature view so the effect is immediately visible.
+        viewMode = 'temperature';
+        const bv = document.getElementById('btn_view');
+        bv.innerText = 'Temperature';
+        bv.classList.add('active');
     }
 });
 
