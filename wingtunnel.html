@@ -31,8 +31,21 @@
             display: block;
             width: 100%;
             height: 100%;
-            object-fit: contain; 
+            object-fit: contain;
             image-rendering: pixelated; /* Fluid looks retro/scientific */
+        }
+        /* GPU (WebGL) fluid canvas sits BEHIND the 2D canvas, which becomes a
+           transparent overlay for the airfoil outline + legend in GPU mode. */
+        #glCanvas {
+            position: absolute;
+            inset: 0;
+            z-index: 0;
+            image-rendering: auto; /* GPU field is high-res; let it interpolate */
+        }
+        #simCanvas {
+            position: absolute;
+            inset: 0;
+            z-index: 1;
         }
 
         /* Floating UI Panel */
@@ -41,6 +54,7 @@
             top: 20px;
             right: 20px;
             width: 320px;
+            z-index: 10; /* above both the GL and 2D canvases (z-index 0/1) */
             max-height: calc(100vh - 40px);
             overflow-y: auto;
             background: var(--panel-bg);
@@ -242,6 +256,7 @@
 <body>
 
     <!-- Main Canvas -->
+    <canvas id="glCanvas"></canvas>
     <canvas id="simCanvas"></canvas>
 
     <!-- UI Overlay -->
@@ -337,6 +352,9 @@
             <button id="btn_mrt">MRT solver</button>
             <button id="btn_freeslip">Free-slip walls</button>
         </div>
+        <div class="btn-row" style="margin-top: 6px;">
+            <button id="btn_gpu">⚡ GPU high-res (experimental)</button>
+        </div>
 
         <div class="stats" id="simStatus">
             Steps: 0<br>
@@ -359,7 +377,11 @@
 // 1. Configuration & Initialization
 // ==========================================
 const canvas = document.getElementById('simCanvas');
-const ctx = canvas.getContext('2d', { alpha: false });
+// alpha:true so that in GPU mode the 2D canvas can be cleared to transparent and
+// act as an overlay (airfoil outline + legend) over the WebGL fluid behind it.
+// In CPU mode the fluid fill writes fully-opaque pixels, so the look is identical.
+const ctx = canvas.getContext('2d', { alpha: true });
+const glCanvas = document.getElementById('glCanvas');
 
 // Simulation Resolution (Fixed Grid)
 // We scale this up to fit the screen, keeping physics calculation manageable
@@ -804,6 +826,7 @@ function buildGeometry() {
     airfoilTE = airfoilPolygon[teIdx];
 
     buildBoundaryData();
+    if (gpu.ok && gpu.active) gpuUploadMask();
 }
 
 function isInside(x, y, poly) {
@@ -2221,6 +2244,10 @@ function syncUIFromState() {
 }
 
 function draw() {
+    // GPU mode renders the fluid on the WebGL canvas behind; the 2D canvas is a
+    // transparent overlay for the airfoil outline + legend.
+    if (gpu.active) { drawGpuFrame(); return; }
+
     // 1. Render Fluid to Offscreen Buffer
     const W = simWidth;
     const H = simHeight;
@@ -2445,23 +2472,33 @@ function draw() {
 
 function loop() {
     if(!paused && !unstable) {
-        for(let k=0; k<8; k++) solve();
-        if (!checkStability()) {
-            unstable = true;
-            // Don't pause if the optimizer is driving — let it reject this candidate.
-            if (!optimizer.active) {
-                paused = true;
-                const btn = document.getElementById('btn_pause');
-                btn.innerText = 'Resume';
-                btn.classList.add('active');
+        if (gpu.active) {
+            // GPU path: ramp the inlet on the CPU (cheap) so the shader uniform
+            // tracks the slider, then run substeps on the GPU. CPU-only features
+            // (forces, particles, optimizer, thermal) are inert in GPU mode.
+            if (currentInletVel < params.speed) currentInletVel += 0.0005;
+            else if (currentInletVel > params.speed) currentInletVel -= 0.0005;
+            for (let k = 0; k < GPU_SUBSTEPS; k++) gpuStep();
+            stepCount += GPU_SUBSTEPS;
+        } else {
+            for(let k=0; k<8; k++) solve();
+            if (!checkStability()) {
+                unstable = true;
+                // Don't pause if the optimizer is driving — let it reject this candidate.
+                if (!optimizer.active) {
+                    paused = true;
+                    const btn = document.getElementById('btn_pause');
+                    btn.innerText = 'Resume';
+                    btn.classList.add('active');
+                }
             }
+            if (particlesEnabled) advectParticles();
+            tickOptimizer();
+            tickFreeFlight();
+            tickPolar();
+            pushHistory();
+            updateAudio();
         }
-        if (particlesEnabled) advectParticles();
-        tickOptimizer();
-        tickFreeFlight();
-        tickPolar();
-        pushHistory();
-        updateAudio();
     }
     draw();
     drawSparkline();
@@ -2693,12 +2730,372 @@ document.addEventListener('keydown', (e) => {
     el.click();
 });
 
+// ============================================================================
+// GPU SOLVER (WebGL2) — Phase 1 of the full migration.
+// D2Q9 collision+streaming + Smagorinsky on the GPU at high resolution.
+// Distributions packed into 3 RGBA32F textures (ping-ponged):
+//   T0: f0,f1,f2,f3   T1: f4,f5,f6,f7   T2: f8, rho, ux, uy
+// Geometry stays on the CPU (rasterized into a high-res mask texture).
+// Forces / Cp / thermal / particles / MRT / Bouzidi are NOT on the GPU yet —
+// those features are disabled while GPU mode is active and come in later phases.
+// ============================================================================
+const GPU_W = 1024, GPU_H = 512;     // ~6.5× the CPU grid (400×200)
+const GPU_SUBSTEPS = 6;              // LBM steps per animation frame (phase-1 conservative)
+let gpuEnabled = false;
+const gpu = { ok: false, active: false, gl: null, reason: '' };
+
+const GPU_VERT = `#version 300 es
+in vec2 a_pos;
+out vec2 v_uv;
+void main(){ v_uv = a_pos*0.5+0.5; gl_Position = vec4(a_pos,0.0,1.0); }`;
+
+// Shared GLSL preamble: D2Q9 constants + equilibrium.
+const GPU_COMMON = `
+const int exq[9]=int[9](0,1,0,-1,0,1,-1,-1,1);
+const int eyq[9]=int[9](0,0,1,0,-1,1,1,-1,-1);
+const int opp[9]=int[9](0,3,4,1,2,7,8,5,6);
+const float wq[9]=float[9](0.444444444,0.111111111,0.111111111,0.111111111,0.111111111,0.027777778,0.027777778,0.027777778,0.027777778);
+float feq(float r,float u,float v,int k){
+  float cu=3.0*(float(exq[k])*u+float(eyq[k])*v);
+  float u2=1.5*(u*u+v*v);
+  return r*wq[k]*(1.0+cu+0.5*cu*cu-u2);
+}`;
+
+const GPU_STEP_FRAG = `#version 300 es
+precision highp float;
+${GPU_COMMON}
+uniform sampler2D u_f0,u_f1,u_f2,u_mask;
+uniform vec2 u_dims;
+uniform float u_uin,u_tau0,u_smag;
+layout(location=0) out vec4 o0;
+layout(location=1) out vec4 o1;
+layout(location=2) out vec4 o2;
+void fetchCell(ivec2 c, out float f[9]){
+  vec4 a=texelFetch(u_f0,c,0); vec4 b=texelFetch(u_f1,c,0); vec4 d=texelFetch(u_f2,c,0);
+  f[0]=a.x;f[1]=a.y;f[2]=a.z;f[3]=a.w;
+  f[4]=b.x;f[5]=b.y;f[6]=b.z;f[7]=b.w;
+  f[8]=d.x;
+}
+void main(){
+  ivec2 c=ivec2(gl_FragCoord.xy);
+  int W=int(u_dims.x), H=int(u_dims.y);
+  float m=texelFetch(u_mask,c,0).r;
+  if(m>0.5){ // solid: hold rest equilibrium
+    o0=vec4(wq[0],wq[1],wq[2],wq[3]);
+    o1=vec4(wq[4],wq[5],wq[6],wq[7]);
+    o2=vec4(wq[8],1.0,0.0,0.0);
+    return;
+  }
+  float self[9]; fetchCell(c,self);
+  float f[9];
+  if(c.x==0){
+    // Inlet: equilibrium at (1, u_in, 0)
+    for(int j=0;j<9;j++) f[j]=feq(1.0,u_uin,0.0,j);
+    o0=vec4(f[0],f[1],f[2],f[3]); o1=vec4(f[4],f[5],f[6],f[7]); o2=vec4(f[8],1.0,u_uin,0.0);
+    return;
+  }
+  if(c.x==W-1){
+    // Convective outlet using old values: f=(self+U*left)/(1+U)
+    float left[9]; fetchCell(ivec2(c.x-1,c.y),left);
+    float uc=max(u_uin,1e-3);
+    float r=0.0,u=0.0,v=0.0;
+    for(int j=0;j<9;j++){ f[j]=(self[j]+uc*left[j])/(1.0+uc); r+=f[j]; u+=f[j]*float(exq[j]); v+=f[j]*float(eyq[j]); }
+    u/=r; v/=r;
+    o0=vec4(f[0],f[1],f[2],f[3]); o1=vec4(f[4],f[5],f[6],f[7]); o2=vec4(f[8],r,u,v);
+    return;
+  }
+  // Pull streaming with half-way bounce-back at solids / domain edges (top/bottom).
+  for(int j=0;j<9;j++){
+    ivec2 src=ivec2(c.x-exq[j], c.y-eyq[j]);
+    bool oob = src.x<0 || src.x>=W || src.y<0 || src.y>=H;
+    if(oob){ f[j]=self[opp[j]]; }
+    else {
+      float ms=texelFetch(u_mask,src,0).r;
+      if(ms>0.5){ f[j]=self[opp[j]]; }
+      else { float n[9]; fetchCell(src,n); f[j]=n[j]; }
+    }
+  }
+  // Macroscopic
+  float r=0.0,u=0.0,v=0.0;
+  for(int j=0;j<9;j++){ r+=f[j]; u+=f[j]*float(exq[j]); v+=f[j]*float(eyq[j]); }
+  u/=r; v/=r;
+  // Smagorinsky eddy viscosity
+  float Qxx=0.0,Qxy=0.0,Qyy=0.0;
+  for(int j=0;j<9;j++){ float fe=feq(r,u,v,j); float fn=f[j]-fe;
+    Qxx+=float(exq[j]*exq[j])*fn; Qxy+=float(exq[j]*eyq[j])*fn; Qyy+=float(eyq[j]*eyq[j])*fn; }
+  float Pi=sqrt(Qxx*Qxx+2.0*Qxy*Qxy+Qyy*Qyy);
+  float tau_add=0.5*(sqrt(u_tau0*u_tau0+18.0*u_smag*u_smag*Pi/r)-u_tau0);
+  float omega=1.0/(u_tau0+tau_add);
+  for(int j=0;j<9;j++){ float fe=feq(r,u,v,j); f[j]=f[j]*(1.0-omega)+fe*omega; }
+  o0=vec4(f[0],f[1],f[2],f[3]); o1=vec4(f[4],f[5],f[6],f[7]); o2=vec4(f[8],r,u,v);
+}`;
+
+const GPU_RENDER_FRAG = `#version 300 es
+precision highp float;
+uniform sampler2D u_f2,u_mask;
+uniform vec2 u_dims;
+uniform float u_speed,u_contrast;
+uniform int u_view;
+in vec2 v_uv;
+out vec4 frag;
+vec3 turbo(float t){ t=clamp(t,0.0,1.0);
+  return vec3(clamp(1.5-abs(4.0*t-3.0),0.0,1.0),
+             clamp(1.5-abs(4.0*t-2.0),0.0,1.0),
+             clamp(1.5-abs(4.0*t-1.0),0.0,1.0)); }
+vec3 diverging(float t){ t=clamp(t,-1.0,1.0);
+  if(t>=0.0) return mix(vec3(0.969),vec3(0.698,0.094,0.169),t);
+  return mix(vec3(0.969),vec3(0.129,0.400,0.675),-t); }
+void main(){
+  // canvas-top (v_uv.y=1) maps to screen-top = field row 0 = GL texel-y 0.
+  int cx=int(v_uv.x*u_dims.x);
+  int cy=int((1.0-v_uv.y)*u_dims.y);
+  cx=clamp(cx,0,int(u_dims.x)-1); cy=clamp(cy,0,int(u_dims.y)-1);
+  ivec2 c=ivec2(cx,cy);
+  if(texelFetch(u_mask,c,0).r>0.5){ frag=vec4(0.157,0.157,0.157,1.0); return; }
+  vec4 d=texelFetch(u_f2,c,0); // (f8, rho, ux, uy)
+  float rho=d.y, ux=d.z, uy=d.w;
+  vec3 col;
+  if(u_view==1){ // vorticity
+    int W=int(u_dims.x),H=int(u_dims.y);
+    float uyR=texelFetch(u_f2,ivec2(min(cx+1,W-1),cy),0).w;
+    float uyL=texelFetch(u_f2,ivec2(max(cx-1,0),cy),0).w;
+    float uxU=texelFetch(u_f2,ivec2(cx,min(cy+1,H-1)),0).z;
+    float uxD=texelFetch(u_f2,ivec2(cx,max(cy-1,0)),0).z;
+    // cy is screen-flipped, so negate the d/dy term to match CPU sign.
+    float omega=0.5*((uyR-uyL) - (-(uxU-uxD)));
+    float vs=0.05/max(u_contrast,0.01);
+    col=diverging(omega/vs);
+  } else if(u_view==2){ // pressure
+    float q=0.5*max(u_speed*u_speed,1e-4);
+    float ps=2.0*q/max(u_contrast,0.01);
+    col=diverging((rho/3.0-1.0/3.0)/ps);
+  } else { // speed
+    float sp=sqrt(ux*ux+uy*uy);
+    float nrm=(sp/(u_speed*2.0))*u_contrast;
+    col=turbo(nrm);
+  }
+  frag=vec4(col,1.0);
+}`;
+
+function gpuCompile(gl, type, src){
+  const s=gl.createShader(type); gl.shaderSource(s,src); gl.compileShader(s);
+  if(!gl.getShaderParameter(s,gl.COMPILE_STATUS)){
+    console.error('[GPU] shader compile failed:\n'+gl.getShaderInfoLog(s));
+    return null;
+  }
+  return s;
+}
+function gpuProgram(gl, vsrc, fsrc){
+  const vs=gpuCompile(gl,gl.VERTEX_SHADER,vsrc); const fs=gpuCompile(gl,gl.FRAGMENT_SHADER,fsrc);
+  if(!vs||!fs) return null;
+  const p=gl.createProgram(); gl.attachShader(p,vs); gl.attachShader(p,fs); gl.linkProgram(p);
+  if(!gl.getProgramParameter(p,gl.LINK_STATUS)){
+    console.error('[GPU] program link failed:\n'+gl.getProgramInfoLog(p));
+    return null;
+  }
+  return p;
+}
+function gpuMakeFieldTex(gl, data){
+  const t=gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D,t);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+  gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA32F,GPU_W,GPU_H,0,gl.RGBA,gl.FLOAT,data);
+  return t;
+}
+function gpuMakeSet(gl){
+  const n=GPU_W*GPU_H;
+  const d0=new Float32Array(n*4), d1=new Float32Array(n*4), d2=new Float32Array(n*4);
+  const W0=0.444444444,W1=0.111111111,W5=0.027777778;
+  for(let i=0;i<n;i++){
+    d0[i*4]=W0; d0[i*4+1]=W1; d0[i*4+2]=W1; d0[i*4+3]=W1;
+    d1[i*4]=W1; d1[i*4+1]=W5; d1[i*4+2]=W5; d1[i*4+3]=W5;
+    d2[i*4]=W5; d2[i*4+1]=1.0; d2[i*4+2]=0.0; d2[i*4+3]=0.0;
+  }
+  const t0=gpuMakeFieldTex(gl,d0), t1=gpuMakeFieldTex(gl,d1), t2=gpuMakeFieldTex(gl,d2);
+  const fbo=gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER,fbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,t0,0);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT1,gl.TEXTURE_2D,t1,0);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT2,gl.TEXTURE_2D,t2,0);
+  const status=gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+  if(status!==gl.FRAMEBUFFER_COMPLETE){ console.error('[GPU] FBO incomplete: 0x'+status.toString(16)); return null; }
+  return {t0,t1,t2,fbo};
+}
+
+function gpuBuildMaskData(){
+  // Rasterize the (CPU-built) polygons into a GPU-resolution mask: 0 fluid,
+  // 1 wall, 2 airfoil. Scale sim-space polygon coords to the GPU grid.
+  const data=new Float32Array(GPU_W*GPU_H);
+  for(let x=0;x<GPU_W;x++){ data[x]=1.0; data[x+(GPU_H-1)*GPU_W]=1.0; }
+  const sx=GPU_W/simWidth, sy=GPU_H/simHeight;
+  const polys=[];
+  if(airfoilPolygon.length>2) polys.push(airfoilPolygon.map(p=>({x:p.x*sx,y:p.y*sy})));
+  for(const ep of extraPolygons) if(ep.length>2) polys.push(ep.map(p=>({x:p.x*sx,y:p.y*sy})));
+  for(const poly of polys){
+    let minX=GPU_W,maxX=0,minY=GPU_H,maxY=0;
+    for(const p of poly){ if(p.x<minX)minX=p.x; if(p.x>maxX)maxX=p.x; if(p.y<minY)minY=p.y; if(p.y>maxY)maxY=p.y; }
+    minX=Math.max(1,Math.floor(minX)); maxX=Math.min(GPU_W-2,Math.ceil(maxX));
+    minY=Math.max(1,Math.floor(minY)); maxY=Math.min(GPU_H-2,Math.ceil(maxY));
+    for(let y=minY;y<=maxY;y++) for(let x=minX;x<=maxX;x++){
+      if(isInside(x,y,poly)) data[x+y*GPU_W]=2.0;
+    }
+  }
+  return data;
+}
+function gpuUploadMask(){
+  if(!gpu.ok) return;
+  const gl=gpu.gl;
+  gl.bindTexture(gl.TEXTURE_2D,gpu.maskTex);
+  gl.texImage2D(gl.TEXTURE_2D,0,gl.R32F,GPU_W,GPU_H,0,gl.RED,gl.FLOAT,gpuBuildMaskData());
+}
+
+function gpuInit(){
+  if(gpu.ok) return true;
+  const gl=glCanvas.getContext('webgl2',{antialias:false,preserveDrawingBuffer:false});
+  if(!gl){ gpu.reason='WebGL2 not available'; console.warn('[GPU] '+gpu.reason); return false; }
+  if(!gl.getExtension('EXT_color_buffer_float')){ gpu.reason='EXT_color_buffer_float unsupported'; console.warn('[GPU] '+gpu.reason); return false; }
+  gpu.gl=gl;
+  gpu.progStep=gpuProgram(gl,GPU_VERT,GPU_STEP_FRAG);
+  gpu.progRender=gpuProgram(gl,GPU_VERT,GPU_RENDER_FRAG);
+  if(!gpu.progStep||!gpu.progRender){ gpu.reason='shader build failed (see console)'; return false; }
+  // Fullscreen quad
+  const quad=new Float32Array([-1,-1, 1,-1, -1,1, -1,1, 1,-1, 1,1]);
+  gpu.vao=gl.createVertexArray(); gl.bindVertexArray(gpu.vao);
+  const vbo=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,vbo);
+  gl.bufferData(gl.ARRAY_BUFFER,quad,gl.STATIC_DRAW);
+  const loc=gl.getAttribLocation(gpu.progStep,'a_pos');
+  gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc,2,gl.FLOAT,false,0,0);
+  // Sets + mask
+  gpu.setA=gpuMakeSet(gl); gpu.setB=gpuMakeSet(gl);
+  if(!gpu.setA||!gpu.setB){ gpu.reason='float FBO unsupported'; return false; }
+  gpu.read=gpu.setA; gpu.write=gpu.setB;
+  gpu.maskTex=gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D,gpu.maskTex);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+  gpu.ok=true;
+  gpuUploadMask();
+  console.log('[GPU] WebGL2 LBM ready — '+GPU_W+'×'+GPU_H+', '+GPU_SUBSTEPS+' substeps/frame');
+  return true;
+}
+
+function gpuResetField(){
+  if(!gpu.ok) return;
+  const gl=gpu.gl;
+  // Re-create both sets at rest (cheapest correct reset).
+  gpu.setA=gpuMakeSet(gl); gpu.setB=gpuMakeSet(gl);
+  gpu.read=gpu.setA; gpu.write=gpu.setB;
+}
+
+function gpuStep(){
+  const gl=gpu.gl;
+  gl.useProgram(gpu.progStep);
+  gl.bindVertexArray(gpu.vao);
+  gl.viewport(0,0,GPU_W,GPU_H);
+  gl.bindFramebuffer(gl.FRAMEBUFFER,gpu.write.fbo);
+  gl.drawBuffers([gl.COLOR_ATTACHMENT0,gl.COLOR_ATTACHMENT1,gl.COLOR_ATTACHMENT2]);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,gpu.read.t0);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D,gpu.read.t1);
+  gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D,gpu.read.t2);
+  gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D,gpu.maskTex);
+  gl.uniform1i(gl.getUniformLocation(gpu.progStep,'u_f0'),0);
+  gl.uniform1i(gl.getUniformLocation(gpu.progStep,'u_f1'),1);
+  gl.uniform1i(gl.getUniformLocation(gpu.progStep,'u_f2'),2);
+  gl.uniform1i(gl.getUniformLocation(gpu.progStep,'u_mask'),3);
+  gl.uniform2f(gl.getUniformLocation(gpu.progStep,'u_dims'),GPU_W,GPU_H);
+  gl.uniform1f(gl.getUniformLocation(gpu.progStep,'u_uin'),currentInletVel);
+  gl.uniform1f(gl.getUniformLocation(gpu.progStep,'u_tau0'),3.0*params.viscosity+0.5);
+  gl.uniform1f(gl.getUniformLocation(gpu.progStep,'u_smag'),params.smagorinsky);
+  gl.drawArrays(gl.TRIANGLES,0,6);
+  const t=gpu.read; gpu.read=gpu.write; gpu.write=t; // swap
+}
+
+function gpuRender(){
+  const gl=gpu.gl;
+  // Match drawing buffer to display size for crisp output.
+  const dispW=glCanvas.clientWidth, dispH=glCanvas.clientHeight;
+  if(glCanvas.width!==dispW) glCanvas.width=dispW;
+  if(glCanvas.height!==dispH) glCanvas.height=dispH;
+  gl.useProgram(gpu.progRender);
+  gl.bindVertexArray(gpu.vao);
+  gl.bindFramebuffer(gl.FRAMEBUFFER,null);
+  gl.viewport(0,0,glCanvas.width,glCanvas.height);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,gpu.read.t2);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D,gpu.maskTex);
+  gl.uniform1i(gl.getUniformLocation(gpu.progRender,'u_f2'),0);
+  gl.uniform1i(gl.getUniformLocation(gpu.progRender,'u_mask'),1);
+  gl.uniform2f(gl.getUniformLocation(gpu.progRender,'u_dims'),GPU_W,GPU_H);
+  gl.uniform1f(gl.getUniformLocation(gpu.progRender,'u_speed'),Math.max(params.speed,0.01));
+  gl.uniform1f(gl.getUniformLocation(gpu.progRender,'u_contrast'),params.contrast);
+  const vmap={speed:0,vorticity:1,pressure:2};
+  gl.uniform1i(gl.getUniformLocation(gpu.progRender,'u_view'), vmap[viewMode]!==undefined?vmap[viewMode]:0);
+  gl.drawArrays(gl.TRIANGLES,0,6);
+}
+
+// 2D overlay on top of the GPU canvas: airfoil outline + legend + badge.
+function drawGpuFrame(){
+  gpuRender();
+  const width = canvas.width = canvas.clientWidth;
+  const height = canvas.height = canvas.clientHeight;
+  ctx.clearRect(0,0,width,height); // transparent — GL fluid shows through
+  if(airfoilPolygon.length>0){
+    const scaleX=width/simWidth, scaleY=height/simHeight;
+    const strokePoly=(poly,fill)=>{
+      ctx.beginPath(); ctx.moveTo(poly[0].x*scaleX,poly[0].y*scaleY);
+      for(let i=1;i<poly.length;i++) ctx.lineTo(poly[i].x*scaleX,poly[i].y*scaleY);
+      ctx.closePath(); ctx.fillStyle=fill; ctx.fill();
+      ctx.strokeStyle="#000"; ctx.lineWidth=2; ctx.stroke();
+    };
+    strokePoly(airfoilPolygon,"#e0e0e0");
+    for(const p of extraPolygons) strokePoly(p,"#c8b8a8");
+  }
+  drawColorLegend(ctx,width,height);
+  // GPU badge
+  ctx.fillStyle='rgba(0,210,255,0.9)';
+  ctx.font='bold 12px monospace';
+  ctx.textAlign='left';
+  ctx.fillText('GPU '+GPU_W+'×'+GPU_H+' (experimental)',20,22);
+}
+
+function setGpuEnabled(on){
+  if(on){
+    if(!gpu.ok && !gpuInit()){
+      alert('GPU mode unavailable: '+(gpu.reason||'unknown')+'\\nStaying on the CPU solver.');
+      gpuEnabled=false;
+      document.getElementById('btn_gpu').classList.remove('active');
+      return;
+    }
+    // GPU render handles speed/vorticity/pressure only (phase 1).
+    if(viewMode!=='speed'&&viewMode!=='vorticity'&&viewMode!=='pressure'){
+      viewMode='speed';
+      const bv=document.getElementById('btn_view');
+      bv.innerText='Speed'; bv.classList.remove('active');
+    }
+    gpuUploadMask();
+    gpuResetField();
+    gpu.active=true; gpuEnabled=true;
+    glCanvas.style.display='block';
+    document.getElementById('btn_gpu').classList.add('active');
+  } else {
+    gpu.active=false; gpuEnabled=false;
+    glCanvas.style.display='none';
+    document.getElementById('btn_gpu').classList.remove('active');
+    initFluid(); // re-seed the CPU field so it resumes cleanly
+  }
+}
+
 // Initialization
 decodeHashToState();
 syncUIFromState();
 buildGeometry();
 initFluid();
 initParticles();
+glCanvas.style.display='none';
 suppressHashWrite = false; // allow hash writes from now on
 
 // Listeners
@@ -2793,6 +3190,10 @@ document.getElementById('btn_mrt').addEventListener('click', function() {
 document.getElementById('btn_freeslip').addEventListener('click', function() {
     freeSlipWalls = !freeSlipWalls;
     this.classList.toggle('active', freeSlipWalls);
+});
+
+document.getElementById('btn_gpu').addEventListener('click', function() {
+    setGpuEnabled(!gpuEnabled);
 });
 
 document.getElementById('btn_thermal').addEventListener('click', function() {
