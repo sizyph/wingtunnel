@@ -364,9 +364,9 @@
             </div>
         </div>
         <div id="gpu_feature_note" style="display:none;font-size:0.62rem;color:var(--accent);opacity:0.8;margin-top:6px;">
-            GPU mode runs speed · vorticity · pressure · temperature · particles ·
-            forces (Cl/Cd) · Cp/wake · free flight · optimizer · polar. MRT and
-            Kármán tone are still CPU-only.
+            GPU mode now covers everything except free-slip walls and the Kármán
+            tone (CPU-only). Views · particles · forces · Cp/wake · free flight ·
+            optimizer · polar · MRT all run on the GPU.
         </div>
 
         <div class="stats" id="simStatus">
@@ -2800,7 +2800,7 @@ let GPU_RES_IDX = 1;
 let GPU_W = GPU_RES_LEVELS[GPU_RES_IDX][0], GPU_H = GPU_RES_LEVELS[GPU_RES_IDX][1];
 let gpuEnabled = false;
 const gpu = { ok: false, active: false, gl: null, reason: '' };
-const BUILD_TAG = 'gpu-p5'; // bump each deploy so cache staleness is visible on-screen
+const BUILD_TAG = 'gpu-p6'; // bump each deploy so cache staleness is visible on-screen
 const GPU_PW = 256, GPU_PH = 128; // particle texture → 32768 tracers
 // The GL canvas renders smooth (image-rendering:auto) vs the CPU canvas's
 // pixelated upscale, so it reads ~0.6 less contrasty. Compensate to match.
@@ -2833,7 +2833,7 @@ precision highp float;
 ${GPU_COMMON}
 uniform sampler2D u_f0,u_f1,u_f2,u_mask,u_T;
 uniform vec2 u_dims;
-uniform float u_uin,u_tau0,u_smag,u_buoy;
+uniform float u_uin,u_tau0,u_smag,u_buoy,u_mrt;
 layout(location=0) out vec4 o0;
 layout(location=1) out vec4 o1;
 layout(location=2) out vec4 o2;
@@ -2901,13 +2901,50 @@ void main(){
   float omega=1.0/(u_tau0+tau_add);
   float gco=1.0-0.5*omega;
   float uDotF = vr*Fy;            // Fx=0
-  for(int j=0;j<9;j++){
-    float fe=feq(r,ur,vr,j);
-    float fp=f[j]*(1.0-omega)+fe*omega;
-    float eF=float(eyq[j])*Fy;
-    float eU=float(exq[j])*ur+float(eyq[j])*vr;
-    fp += gco*wq[j]*(3.0*eF + 9.0*eU*eF - 3.0*uDotF);
-    f[j]=fp;
+  if(u_mrt>0.5){
+    // Lallemand-Luo MRT: project to moments, relax each, project back.
+    float a0=f[0],a1=f[1],a2=f[2],a3=f[3],a4=f[4],a5=f[5],a6=f[6],a7=f[7],a8=f[8];
+    float m_e  =-4.0*a0 - a1 - a2 - a3 - a4 + 2.0*a5 + 2.0*a6 + 2.0*a7 + 2.0*a8;
+    float m_eps= 4.0*a0 - 2.0*a1 - 2.0*a2 - 2.0*a3 - 2.0*a4 + a5 + a6 + a7 + a8;
+    float jx   = a1 - a3 + a5 - a6 - a7 + a8;
+    float m_qx =-2.0*a1 + 2.0*a3 + a5 - a6 - a7 + a8;
+    float jy   = a2 - a4 + a5 + a6 - a7 - a8;
+    float m_qy =-2.0*a2 + 2.0*a4 + a5 + a6 - a7 - a8;
+    float m_pxx= a1 - a2 + a3 - a4;
+    float m_pxy= a5 - a6 + a7 - a8;
+    float usq=ur*ur+vr*vr;
+    const float S_E=1.4, S_EPS=1.4, S_Q=1.7;
+    float me_p  = m_e   + S_E  *(r*(-2.0+3.0*usq) - m_e);
+    float meps_p= m_eps + S_EPS*(r*( 1.0-3.0*usq) - m_eps);
+    float mqx_p = m_qx  + S_Q  *(-r*ur - m_qx);
+    float mqy_p = m_qy  + S_Q  *(-r*vr - m_qy);
+    float mpxx_p= m_pxx + omega*(r*(ur*ur-vr*vr) - m_pxx);
+    float mpxy_p= m_pxy + omega*(r*ur*vr - m_pxy);
+    float r9=r/9.0, e9=me_p/9.0, e18=me_p/18.0, e36=me_p/36.0;
+    float p9=meps_p/9.0, p18=meps_p/18.0, p36=meps_p/36.0;
+    float jx6=jx/6.0, jy6=jy/6.0, qx6=mqx_p/6.0, qx12=mqx_p/12.0, qy6=mqy_p/6.0, qy12=mqy_p/12.0;
+    float xx4=mpxx_p/4.0, xy4=mpxy_p/4.0;
+    f[0]=r9 - e9 + p9;
+    f[1]=r9 - e36 - p18 + jx6 - qx6 + xx4;
+    f[2]=r9 - e36 - p18 + jy6 - qy6 - xx4;
+    f[3]=r9 - e36 - p18 - jx6 + qx6 + xx4;
+    f[4]=r9 - e36 - p18 - jy6 + qy6 - xx4;
+    f[5]=r9 + e18 + p36 + jx6 + qx12 + jy6 + qy12 + xy4;
+    f[6]=r9 + e18 + p36 - jx6 - qx12 + jy6 + qy12 - xy4;
+    f[7]=r9 + e18 + p36 - jx6 - qx12 - jy6 - qy12 + xy4;
+    f[8]=r9 + e18 + p36 + jx6 + qx12 - jy6 - qy12 - xy4;
+    for(int j=0;j<9;j++){
+      float eF=float(eyq[j])*Fy, eU=float(exq[j])*ur+float(eyq[j])*vr;
+      f[j]+=gco*wq[j]*(3.0*eF + 9.0*eU*eF - 3.0*uDotF);
+    }
+  } else {
+    for(int j=0;j<9;j++){
+      float fe=feq(r,ur,vr,j);
+      float fp=f[j]*(1.0-omega)+fe*omega;
+      float eF=float(eyq[j])*Fy, eU=float(exq[j])*ur+float(eyq[j])*vr;
+      fp += gco*wq[j]*(3.0*eF + 9.0*eU*eF - 3.0*uDotF);
+      f[j]=fp;
+    }
   }
   o0=vec4(f[0],f[1],f[2],f[3]); o1=vec4(f[4],f[5],f[6],f[7]); o2=vec4(f[8],r,ur,vr);
 }`;
@@ -3320,6 +3357,7 @@ function gpuStep(){
   gl.uniform1f(gl.getUniformLocation(gpu.progStep,'u_tau0'),3.0*params.viscosity+0.5);
   gl.uniform1f(gl.getUniformLocation(gpu.progStep,'u_smag'),params.smagorinsky);
   gl.uniform1f(gl.getUniformLocation(gpu.progStep,'u_buoy'), thermalEnabled?G_BUOYANCY:0.0);
+  gl.uniform1f(gl.getUniformLocation(gpu.progStep,'u_mrt'), mrtEnabled?1.0:0.0);
   gl.drawArrays(gl.TRIANGLES,0,6);
   const t=gpu.read; gpu.read=gpu.write; gpu.write=t; // swap
   if(thermalEnabled) gpuStepThermal();
@@ -3572,7 +3610,7 @@ function drawGpuFrame(){
 // CPU-only features that are inert while the GPU solver runs (phase 1). Grey
 // them out so it's clear they're unavailable rather than silently broken.
 function setGpuFeatureLock(on){
-  const ids=['btn_audio','btn_mrt','btn_freeslip'];
+  const ids=['btn_audio','btn_freeslip'];
   ids.forEach(id=>{ const el=document.getElementById(id); if(el) el.disabled=on; });
   const note=document.getElementById('gpu_feature_note');
   if(note) note.style.display = on ? '' : 'none';
