@@ -355,6 +355,18 @@
         <div class="btn-row" style="margin-top: 6px;">
             <button id="btn_gpu">⚡ GPU high-res (experimental)</button>
         </div>
+        <div id="ctrl_gpu" style="display: none; margin-top: 8px;">
+            <label>GPU resolution <span id="disp_gpures" class="val-disp">1024×512</span></label>
+            <input type="range" id="in_gpures" min="0" max="4" step="1" value="1">
+            <div class="slider-scale"><span>fast</span><span>balanced</span><span>ultra</span></div>
+            <div style="font-size:0.62rem;color:var(--text-dim);opacity:0.7;margin-top:4px;">
+                Higher = finer detail on the foil. Substeps auto-scale to keep it interactive.
+            </div>
+        </div>
+        <div id="gpu_feature_note" style="display:none;font-size:0.62rem;color:var(--accent);opacity:0.8;margin-top:6px;">
+            In GPU mode, forces · Cp · particles · thermal · optimizer · MRT are paused
+            (CPU-only for now — being ported in later phases).
+        </div>
 
         <div class="stats" id="simStatus">
             Steps: 0<br>
@@ -2478,8 +2490,9 @@ function loop() {
             // (forces, particles, optimizer, thermal) are inert in GPU mode.
             if (currentInletVel < params.speed) currentInletVel += 0.0005;
             else if (currentInletVel > params.speed) currentInletVel -= 0.0005;
-            for (let k = 0; k < GPU_SUBSTEPS; k++) gpuStep();
-            stepCount += GPU_SUBSTEPS;
+            const ns = gpuSubsteps();
+            for (let k = 0; k < ns; k++) gpuStep();
+            stepCount += ns;
         } else {
             for(let k=0; k<8; k++) solve();
             if (!checkStability()) {
@@ -2739,10 +2752,16 @@ document.addEventListener('keydown', (e) => {
 // Forces / Cp / thermal / particles / MRT / Bouzidi are NOT on the GPU yet —
 // those features are disabled while GPU mode is active and come in later phases.
 // ============================================================================
-const GPU_W = 1024, GPU_H = 512;     // ~6.5× the CPU grid (400×200)
-const GPU_SUBSTEPS = 6;              // LBM steps per animation frame (phase-1 conservative)
+// Resolution is selectable (a uniform lattice; higher res = more cells on the
+// foil where gradients are steepest). 2:1 aspect to match the domain.
+const GPU_RES_LEVELS = [[768,384],[1024,512],[1536,768],[2048,1024],[2560,1280]];
+let GPU_RES_IDX = 1;
+let GPU_W = GPU_RES_LEVELS[GPU_RES_IDX][0], GPU_H = GPU_RES_LEVELS[GPU_RES_IDX][1];
 let gpuEnabled = false;
 const gpu = { ok: false, active: false, gl: null, reason: '' };
+// Substeps auto-scale inversely with cell count, holding per-frame work roughly
+// constant so the highest resolutions stay interactive.
+function gpuSubsteps(){ return Math.max(2, Math.round(6*(1024*512)/(GPU_W*GPU_H))); }
 
 const GPU_VERT = `#version 300 es
 in vec2 a_pos;
@@ -2804,16 +2823,17 @@ void main(){
     o0=vec4(f[0],f[1],f[2],f[3]); o1=vec4(f[4],f[5],f[6],f[7]); o2=vec4(f[8],r,u,v);
     return;
   }
-  // Pull streaming with half-way bounce-back at solids / domain edges (top/bottom).
+  // Pull streaming with half-way bounce-back at solids / domain edges.
+  // Each direction needs ONLY its own distribution from the source cell, so we
+  // fetch a single texture/component instead of the whole 9-vector neighbour.
   for(int j=0;j<9;j++){
     ivec2 src=ivec2(c.x-exq[j], c.y-eyq[j]);
     bool oob = src.x<0 || src.x>=W || src.y<0 || src.y>=H;
-    if(oob){ f[j]=self[opp[j]]; }
-    else {
-      float ms=texelFetch(u_mask,src,0).r;
-      if(ms>0.5){ f[j]=self[opp[j]]; }
-      else { float n[9]; fetchCell(src,n); f[j]=n[j]; }
-    }
+    bool solid = (!oob) && (texelFetch(u_mask,src,0).r>0.5);
+    if(oob||solid){ f[j]=self[opp[j]]; }
+    else if(j<4){ f[j]=texelFetch(u_f0,src,0)[j]; }
+    else if(j<8){ f[j]=texelFetch(u_f1,src,0)[j-4]; }
+    else { f[j]=texelFetch(u_f2,src,0).x; }
   }
   // Macroscopic
   float r=0.0,u=0.0,v=0.0;
@@ -2980,16 +3000,37 @@ function gpuInit(){
   gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
   gpu.ok=true;
   gpuUploadMask();
-  console.log('[GPU] WebGL2 LBM ready — '+GPU_W+'×'+GPU_H+', '+GPU_SUBSTEPS+' substeps/frame');
+  console.log('[GPU] WebGL2 LBM ready — '+GPU_W+'×'+GPU_H+', '+gpuSubsteps()+' substeps/frame');
   return true;
+}
+
+function gpuDeleteSet(s){
+  if(!s||!gpu.gl) return;
+  const gl=gpu.gl;
+  gl.deleteTexture(s.t0); gl.deleteTexture(s.t1); gl.deleteTexture(s.t2);
+  gl.deleteFramebuffer(s.fbo);
 }
 
 function gpuResetField(){
   if(!gpu.ok) return;
   const gl=gpu.gl;
   // Re-create both sets at rest (cheapest correct reset).
+  gpuDeleteSet(gpu.setA); gpuDeleteSet(gpu.setB);
   gpu.setA=gpuMakeSet(gl); gpu.setB=gpuMakeSet(gl);
   gpu.read=gpu.setA; gpu.write=gpu.setB;
+}
+
+// Change the GPU lattice resolution and rebuild the textures/mask at the new size.
+function gpuSetResolution(idx){
+  GPU_RES_IDX=Math.max(0,Math.min(GPU_RES_LEVELS.length-1,idx));
+  GPU_W=GPU_RES_LEVELS[GPU_RES_IDX][0];
+  GPU_H=GPU_RES_LEVELS[GPU_RES_IDX][1];
+  const disp=document.getElementById('disp_gpures');
+  if(disp) disp.innerText=GPU_W+'×'+GPU_H;
+  if(gpu.ok){
+    gpuResetField();   // recreates sets at the new size (also reseeds at rest)
+    gpuUploadMask();   // rebuild mask at the new size
+  }
 }
 
 function gpuStep(){
@@ -3059,7 +3100,17 @@ function drawGpuFrame(){
   ctx.fillStyle='rgba(0,210,255,0.9)';
   ctx.font='bold 12px monospace';
   ctx.textAlign='left';
-  ctx.fillText('GPU '+GPU_W+'×'+GPU_H+' (experimental)',20,22);
+  ctx.fillText('GPU '+GPU_W+'×'+GPU_H+' · '+gpuSubsteps()+' substeps (experimental)',20,22);
+}
+
+// CPU-only features that are inert while the GPU solver runs (phase 1). Grey
+// them out so it's clear they're unavailable rather than silently broken.
+function setGpuFeatureLock(on){
+  const ids=['btn_particles','btn_forces','btn_thermal','btn_optimize',
+             'btn_freeflight','btn_polar','btn_audio','btn_mrt','btn_freeslip'];
+  ids.forEach(id=>{ const el=document.getElementById(id); if(el) el.disabled=on; });
+  const note=document.getElementById('gpu_feature_note');
+  if(note) note.style.display = on ? '' : 'none';
 }
 
 function setGpuEnabled(on){
@@ -3081,10 +3132,14 @@ function setGpuEnabled(on){
     gpu.active=true; gpuEnabled=true;
     glCanvas.style.display='block';
     document.getElementById('btn_gpu').classList.add('active');
+    document.getElementById('ctrl_gpu').style.display='';
+    setGpuFeatureLock(true);
   } else {
     gpu.active=false; gpuEnabled=false;
     glCanvas.style.display='none';
     document.getElementById('btn_gpu').classList.remove('active');
+    document.getElementById('ctrl_gpu').style.display='none';
+    setGpuFeatureLock(false);
     initFluid(); // re-seed the CPU field so it resumes cleanly
   }
 }
@@ -3194,6 +3249,10 @@ document.getElementById('btn_freeslip').addEventListener('click', function() {
 
 document.getElementById('btn_gpu').addEventListener('click', function() {
     setGpuEnabled(!gpuEnabled);
+});
+
+document.getElementById('in_gpures').addEventListener('input', (e) => {
+    gpuSetResolution(parseInt(e.target.value, 10));
 });
 
 document.getElementById('btn_thermal').addEventListener('click', function() {
