@@ -370,6 +370,9 @@
             <button id="btn_optimize">Optimize ↑ Cl</button>
         </div>
         <div class="btn-row" style="margin-top: 6px;">
+            <button id="btn_gradopt">∇Cl gradient</button>
+        </div>
+        <div class="btn-row" style="margin-top: 6px;">
             <button id="btn_polar">Run Polar</button>
             <button id="btn_audio">Karman tone</button>
         </div>
@@ -1070,6 +1073,7 @@ function setOptimizerLock(locked) {
 
 function startOptimize() {
     if (optimizer.active) { stopOptimize(); return; }
+    if (gradOpt.active) stopGradOpt();
     if (geomMode !== 'naca') setGeomMode('naca');
     optimizer.active = true;
     optimizer.iter = 0;
@@ -1155,6 +1159,102 @@ function tickOptimizer() {
     }
 }
 
+// ---------- Gradient (finite-difference) shape optimizer ----------
+// Steepest-ascent on Cl over the continuous design vector (m,p,t,AoA): estimate
+// ∂Cl/∂pᵢ by perturbing each parameter (5 forward measurements per step), then
+// move all four along the unit-balanced normalized gradient. Far more directed
+// than the random hill-climber. (A true LBM adjoint would get the whole gradient
+// in one backward solve, but for 4 parameters finite differences are simpler,
+// robust, and just as effective.)
+const gradOpt = {
+    active: false,
+    vec: null,                 // continuous {m,p,t,aoa}
+    grad: { m:0, p:0, t:0, aoa:0 },
+    baseCl: 0,
+    evalIdx: -1,               // -1 = baseline, 0..3 = perturb m/p/t/aoa
+    phase: 'settle',
+    settleFrames: 0, settleTarget: 45,
+    measureFrames: 0, measureTarget: 20,
+    sumCl: 0,
+    iter: 0, maxIter: 8,
+    fd:    { m:1, p:1, t:1, aoa:1 },     // finite-difference steps
+    range: { m:9, p:9, t:20, aoa:50 },   // for unit-balancing the step
+    stepFrac: 0.12
+};
+const GRAD_KEYS = ['m','p','t','aoa'];
+
+function gradVecToParams(v){
+    let m = Math.max(0, Math.min(9, Math.round(v.m)));
+    let p = Math.max(0, Math.min(9, Math.round(v.p)));
+    let t = Math.max(4, Math.min(24, Math.round(v.t)));
+    if (m === 0) p = 0; else if (p === 0) p = 4;
+    const tStr = t < 10 ? '0'+t : ''+t;
+    const aoa = Math.max(-25, Math.min(25, Math.round(v.aoa)));
+    return { code: ''+m+p+tStr, aoa };
+}
+
+function startGradEval(){
+    const g = gradOpt;
+    const v = { m:g.vec.m, p:g.vec.p, t:g.vec.t, aoa:g.vec.aoa };
+    if (g.evalIdx >= 0) { const k = GRAD_KEYS[g.evalIdx]; v[k] += g.fd[k]; }
+    applyOptParams(gradVecToParams(v));
+    resetSolverField();
+    g.phase = 'settle'; g.settleFrames = 0; g.measureFrames = 0; g.sumCl = 0;
+}
+
+function startGradOpt(){
+    if (gradOpt.active) { stopGradOpt(); return; }
+    if (optimizer.active) stopOptimize();
+    if (polar.active) stopPolar();
+    if (geomMode !== 'naca') setGeomMode('naca');
+    const n = parseNaca(nacaCode) ? nacaCode : '2412';
+    gradOpt.vec = { m:parseInt(n[0],10), p:parseInt(n[1],10),
+                    t:parseInt(n.substring(2,4),10), aoa:params.aoa };
+    gradOpt.active = true; gradOpt.iter = 0; gradOpt.evalIdx = -1;
+    startGradEval();
+    const btn = document.getElementById('btn_gradopt');
+    btn.classList.add('active'); btn.innerText = 'Stop ∇';
+    setOptimizerLock(true);
+}
+
+function stopGradOpt(){
+    if (!gradOpt.active) return;
+    gradOpt.active = false;
+    applyOptParams(gradVecToParams(gradOpt.vec));
+    const btn = document.getElementById('btn_gradopt');
+    btn.classList.remove('active'); btn.innerText = '∇Cl gradient';
+    setOptimizerLock(false);
+}
+
+function tickGradOpt(){
+    if (!gradOpt.active) return;
+    const g = gradOpt;
+    if (g.phase === 'settle') {
+        if (++g.settleFrames >= g.settleTarget) { g.phase='measure'; g.measureFrames=0; g.sumCl=0; }
+        return;
+    }
+    if (unstable) { unstable = false; paused = false; } // FD tolerates a blip
+    g.sumCl += isFinite(Cl) ? Cl : g.baseCl; // guard a divergent candidate
+    if (++g.measureFrames < g.measureTarget) return;
+    const avgCl = g.sumCl / g.measureTarget;
+    if (g.evalIdx === -1) g.baseCl = avgCl;
+    else g.grad[GRAD_KEYS[g.evalIdx]] = (avgCl - g.baseCl) / g.fd[GRAD_KEYS[g.evalIdx]];
+    g.evalIdx++;
+    if (g.evalIdx > 3) {
+        // Unit-balanced normalized ascent step.
+        const R = g.range;
+        const gm=g.grad.m*R.m, gp=g.grad.p*R.p, gt=g.grad.t*R.t, ga=g.grad.aoa*R.aoa;
+        const norm = Math.sqrt(gm*gm+gp*gp+gt*gt+ga*ga) || 1;
+        g.vec.m   = Math.max(0, Math.min(9,  g.vec.m   + g.stepFrac*R.m  *(gm/norm)));
+        g.vec.p   = Math.max(0, Math.min(9,  g.vec.p   + g.stepFrac*R.p  *(gp/norm)));
+        g.vec.t   = Math.max(4, Math.min(24, g.vec.t   + g.stepFrac*R.t  *(gt/norm)));
+        g.vec.aoa = Math.max(-25,Math.min(25,g.vec.aoa + g.stepFrac*R.aoa*(ga/norm)));
+        g.iter++; g.evalIdx = -1;
+        if (g.iter >= g.maxIter) { stopGradOpt(); return; }
+    }
+    startGradEval();
+}
+
 // FSI integrator: pitch the wing under the aerodynamic moment about its
 // pivot. I·α̈ = M − γ·α̇, integrated explicit-Euler at one LBM step per call
 // (called once per animation frame, after 8 substeps of solve()).
@@ -1162,7 +1262,7 @@ function tickOptimizer() {
 // input always wins.
 function tickFreeFlight() {
     if (!freeFlightEnabled) return;
-    if (optimizer.active) return;
+    if (optimizer.active || gradOpt.active) return;
     if (dragging || draggingFlap) {
         // User is steering — let them, and clear the angular rate so the
         // wing doesn't keep coasting in the wrong direction after release.
@@ -1203,7 +1303,7 @@ function getEquilibrium(rho, u, v, i) {
 function startPolar() {
     if (polar.active) { stopPolar(); return; }
     if (geomMode === 'cylinder') return; // AoA meaningless
-    if (optimizer.active) return;        // optimizer owns the AoA channel
+    if (optimizer.active || gradOpt.active) return; // an optimizer owns the AoA channel
     if (freeFlightEnabled) {
         // Take direct control from the FSI integrator while sweeping.
         document.getElementById('btn_freeflight').click();
@@ -2538,8 +2638,8 @@ function loop() {
             if (particlesEnabled) gpuUpdateParticles();
             // Aerodynamic forces from the GPU field. Throttled (readback syncs),
             // but run every frame while polar/optimizer need a responsive Cl.
-            const needForces = forcesEnabled || freeFlightEnabled || polar.active || optimizer.active;
-            const forceNow = polar.active || optimizer.active || (++gpuForceTick % 3 === 0);
+            const needForces = forcesEnabled || freeFlightEnabled || polar.active || optimizer.active || gradOpt.active;
+            const forceNow = polar.active || optimizer.active || gradOpt.active || (++gpuForceTick % 3 === 0);
             if (needForces && forceNow) {
                 const F = gpuComputeForces();
                 const chordGpu = airfoilChord * (GPU_W / simWidth);
@@ -2561,6 +2661,7 @@ function loop() {
                 if (forcesEnabled) gpuReadbackField();
             }
             tickOptimizer();
+            tickGradOpt();
             tickFreeFlight();
             tickPolar();
             pushHistory();
@@ -2579,6 +2680,7 @@ function loop() {
             }
             if (particlesEnabled) advectParticles();
             tickOptimizer();
+            tickGradOpt();
             tickFreeFlight();
             tickPolar();
             pushHistory();
@@ -2607,6 +2709,13 @@ function loop() {
         html += `<br><span style="color:${'#00d2ff'}">Optimizer ${optimizer.iter}/${optimizer.maxIter} (${phaseTxt})<br>` +
                 `Trial: NACA ${optimizer.trial.code} α=${optimizer.trial.aoa}°<br>` +
                 `Best:  NACA ${optimizer.best.code} α=${optimizer.best.aoa}° Cl=${bestCl}</span>`;
+    } else if (gradOpt.active) {
+        const g = gradOpt;
+        const evalTxt = g.evalIdx === -1 ? 'baseline' : ('∂/∂' + GRAD_KEYS[g.evalIdx]);
+        const cur = gradVecToParams(g.vec);
+        html += `<br><span style="color:#00d2ff">∇ optimizer ${g.iter}/${g.maxIter} · ${evalTxt} (${g.phase})<br>` +
+                `Design: NACA ${cur.code} α=${cur.aoa}°<br>` +
+                `base Cl=${g.baseCl.toFixed(3)}</span>`;
     } else if (unstable) {
         html += `<br><span style="color:#ff6b6b">⚠ Unstable — lower speed or raise viscosity, then Reset.</span>`;
     }
@@ -2707,7 +2816,7 @@ function flapPivotCanvas() {
 
 canvas.addEventListener('mousedown', (e) => {
     if (e.button !== 0) return;
-    if (optimizer.active) return;
+    if (optimizer.active || gradOpt.active) return;
     const p = canvasEventPos(e);
     // Flap takes priority — its bbox usually overlaps the main wing's hit zone.
     if (inFlapZone(p)) {
@@ -2832,7 +2941,7 @@ let GPU_RES_IDX = 1;
 let GPU_W = GPU_RES_LEVELS[GPU_RES_IDX][0], GPU_H = GPU_RES_LEVELS[GPU_RES_IDX][1];
 let gpuEnabled = false;
 const gpu = { ok: false, active: false, gl: null, reason: '' };
-const BUILD_TAG = 'gpu-p8'; // bump each deploy so cache staleness is visible on-screen
+const BUILD_TAG = 'gpu-p9'; // bump each deploy so cache staleness is visible on-screen
 const GPU_PW = 256, GPU_PH = 128; // particle texture → 32768 tracers
 // The GL canvas renders smooth (image-rendering:auto) vs the CPU canvas's
 // pixelated upscale, so it reads ~0.6 less contrasty. Compensate to match.
@@ -3764,6 +3873,11 @@ document.getElementById('btn_forces').addEventListener('click', function() {
 document.getElementById('btn_optimize').addEventListener('click', function() {
     if (optimizer.active) stopOptimize();
     else startOptimize();
+});
+
+document.getElementById('btn_gradopt').addEventListener('click', function() {
+    if (gradOpt.active) stopGradOpt();
+    else startGradOpt();
 });
 
 document.getElementById('btn_freeflight').addEventListener('click', function() {
